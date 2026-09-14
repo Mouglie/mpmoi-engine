@@ -1,0 +1,3 @@
+# Build output of build.sh — a ~100 MB native binary, regenerated locally / by the packaging step.
+/mpmoi-engine
+/mpmoi-engine.exe
