@@ -30,6 +30,9 @@ type pushRegisterQuery struct {
 }
 
 func (c *Client) RegisterPushNotifications(ctx context.Context, endpoint string, keys PushKeys) error {
+	if c == nil {
+		return ErrClientIsNil
+	}
 	jsonKeys, err := json.Marshal(&keys)
 	if err != nil {
 		return err
@@ -74,6 +77,9 @@ func (c *Client) RegisterPushNotifications(ctx context.Context, endpoint string,
 }
 
 func (c *Client) FetchMedia(ctx context.Context, mediaID, mediaShortcode string) (*responses.FetchMediaResponse, error) {
+	if c == nil {
+		return nil, ErrClientIsNil
+	}
 	h := c.http.BuildHeaders(true, false)
 	h.Set("x-requested-with", "XMLHttpRequest")
 	referer := c.GetEndpoint("base_url")
@@ -94,8 +100,6 @@ func (c *Client) FetchMedia(ctx context.Context, mediaID, mediaShortcode string)
 		return nil, fmt.Errorf("failed to fetch the media by id %s: %w", mediaID, err)
 	}
 
-	c.cookies.UpdateFromResponse(resp)
-
 	var mediaInfo *responses.FetchMediaResponse
 	err = json.Unmarshal(respBody, &mediaInfo)
 	if err != nil {
@@ -106,6 +110,9 @@ func (c *Client) FetchMedia(ctx context.Context, mediaID, mediaShortcode string)
 }
 
 func (c *Client) FetchReel(ctx context.Context, reelIDs []string, mediaID string) (*responses.ReelInfoResponse, error) {
+	if c == nil {
+		return nil, ErrClientIsNil
+	}
 	h := c.http.BuildHeaders(true, false)
 	h.Set("x-requested-with", "XMLHttpRequest")
 	h.Set("referer", c.GetEndpoint("base_url"))
@@ -127,8 +134,6 @@ func (c *Client) FetchReel(ctx context.Context, reelIDs []string, mediaID string
 		c.checkResponseError(err)
 		return nil, fmt.Errorf("failed to fetch reels by ids %v: %w", reelIDs, err)
 	}
-
-	c.cookies.UpdateFromResponse(resp)
 
 	var reelInfo *responses.ReelInfoResponse
 	err = json.Unmarshal(respBody, &reelInfo)

@@ -3,9 +3,11 @@ package messagix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
@@ -14,6 +16,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
+
+const SyncResponseTimeout = 30 * time.Second
 
 type SyncManager struct {
 	client *Client
@@ -80,12 +84,18 @@ func (sm *SyncManager) syncSocketData(ctx context.Context, db int64, cb func(), 
 
 	err := sm.recursivelySyncSocketData(ctx, db, database, nil)
 	if err != nil {
-		sm.client.Logger.Err(err).Int64("database_id", db).Msg("Failed to sync database through socket")
+		sm.client.Logger.Err(err).
+			Int64("database_id", db).
+			Any("database", database).
+			Msg("Failed to sync database through socket")
 		if db == 1 {
-			*outErr = fmt.Errorf("failed to sync db 1: %w", err)
+			*outErr = err
 		}
 	} else {
-		sm.client.Logger.Debug().Any("database_id", db).Any("database", database).Msg("Synced database")
+		sm.client.Logger.Debug().
+			Any("database_id", db).
+			Any("database", database).
+			Msg("Synced database")
 	}
 }
 
@@ -157,6 +167,9 @@ func (sm *SyncManager) recursivelySyncSocketData(
 		}
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-time.After(SyncResponseTimeout):
+		sm.client.socketSyncWaiters.Delete(packetID)
+		return fmt.Errorf("timeout waiting for database sync response")
 	}
 
 	tbl, err := resp.Parse(ctx)
@@ -170,7 +183,8 @@ func (sm *SyncManager) recursivelySyncSocketData(
 			Any("sync_failures", tbl.LSHandleSyncFailure).
 			Msg("Sync failures found")
 	}
-	if len(tbl.LSExecuteFirstBlockForSyncTransaction) == 0 {
+	firstBlocks := tbl.GetLSExecuteFirstBlockForSyncTransactionV4()
+	if len(firstBlocks) == 0 {
 		sm.client.Logger.Warn().
 			Any("database_id", databaseID).
 			Any("payload", string(jsonPayload)).
@@ -179,7 +193,7 @@ func (sm *SyncManager) recursivelySyncSocketData(
 			Msg("No transactions found")
 		return nil
 	}
-	block := tbl.LSExecuteFirstBlockForSyncTransaction[0]
+	block := firstBlocks[0]
 	nextCursor, currentCursor := block.NextCursor, block.CurrentCursor
 	sm.client.Logger.Debug().
 		Any("full_block", block).
@@ -241,7 +255,7 @@ func (sm *SyncManager) SyncDataGraphQL(ctx context.Context, dbs []int64) (*table
 	return tableData, nil
 }
 
-func (sm *SyncManager) SyncTransactions(transactions []*table.LSExecuteFirstBlockForSyncTransaction) error {
+func (sm *SyncManager) SyncTransactions(transactions []*table.LSExecuteFirstBlockForSyncTransactionV4) error {
 	for _, transaction := range transactions {
 		database, ok := sm.store[transaction.DatabaseID]
 		if !ok {
@@ -251,10 +265,12 @@ func (sm *SyncManager) SyncTransactions(transactions []*table.LSExecuteFirstBloc
 		database.LastAppliedCursor = &transaction.NextCursor
 		database.SendSyncParams = transaction.SendSyncParams
 		database.SyncChannel = socket.SyncChannel(transaction.SyncChannel)
+		database.CurrentSeqID = transaction.CurrentSeqID
 		sm.client.Logger.Debug().
 			Any("new_cursor", database.LastAppliedCursor).
 			Any("sync_channel", database.SyncChannel).
 			Any("send_sync_params", database.SendSyncParams).
+			Int64("current_seq_id", database.CurrentSeqID).
 			Any("database_id", transaction.DatabaseID).
 			Msg("Updated database by transaction...")
 	}
@@ -355,14 +371,8 @@ these 3 return the same stuff
 updateThreadsRangesV2, upsertInboxThreadsRange, upsertSyncGroupThreadsRange
 */
 func (sm *SyncManager) updateSyncGroupCursors(table *table.LSTable) error {
-	var err error
-	if len(table.LSUpsertSyncGroupThreadsRange) > 0 {
-		err = sm.updateThreadRanges(table.LSUpsertSyncGroupThreadsRange)
-	}
-
-	if len(table.LSExecuteFirstBlockForSyncTransaction) > 0 {
-		err = sm.SyncTransactions(table.LSExecuteFirstBlockForSyncTransaction)
-	}
-
-	return err
+	return errors.Join(
+		sm.updateThreadRanges(table.LSUpsertSyncGroupThreadsRange),
+		sm.SyncTransactions(table.GetLSExecuteFirstBlockForSyncTransactionV4()),
+	)
 }

@@ -103,6 +103,8 @@ func (m *MetaClient) handleUpsertMessages(tk handlerParams, upsert *table.Upsert
 }
 
 func (m *MetaClient) handleUpdateExistingMessageRange(tk handlerParams, rng *table.LSUpdateExistingMessageRange) bridgev2.RemoteEvent {
+	m.backfillLock.Lock()
+	defer m.backfillLock.Unlock()
 	logEvt := m.UserLogin.Log.Info().
 		Str("action", "handle meta existing range").
 		Int64("thread_key", tk.ID).
@@ -254,7 +256,7 @@ func (m *MetaClient) FetchMessages(ctx context.Context, params bridgev2.FetchMes
 		defer m.removeBackfillCollector(threadID, collector)
 		start := time.Now()
 		timeout := BackfillTimeout
-		if params.Forward && bridgev2.PortalEventBuffer == 0 {
+		if params.Forward && m.Main.Bridge.Config.PortalEventBuffer == 0 {
 			timeout = BackfillForwardTimeout
 		}
 		if m.Main.Bridge.Background {
@@ -350,7 +352,7 @@ func (m *MetaClient) wrapBackfillEvents(ctx context.Context, portal *bridgev2.Po
 		}
 		msgID := metaid.MakeFBMessageID(msg.MessageId)
 		wrappedMessages[i] = &bridgev2.BackfillMessage{
-			ConvertedMessage: m.Main.MsgConv.ToMatrix(ctx, portal, m.Client, m.UserLogin, intent, msgID, msg, m.Main.Config.DisableXMABackfill || m.Main.Config.DisableXMAAlways),
+			ConvertedMessage: m.Main.MsgConv.ToMatrix(ctx, portal, m.Client, m.UserLogin, intent, msgID, msg),
 			Sender:           sender,
 			ID:               msgID,
 			Timestamp:        time.UnixMilli(msg.TimestampMs),

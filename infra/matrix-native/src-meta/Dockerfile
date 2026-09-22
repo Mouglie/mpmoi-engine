@@ -4,7 +4,7 @@ RUN apk add --no-cache git ca-certificates build-base su-exec olm-dev
 
 COPY . /build
 WORKDIR /build
-RUN ./build.sh
+RUN ./build-fb.sh
 
 FROM alpine:3.24
 

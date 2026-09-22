@@ -18,8 +18,20 @@ import (
 )
 
 type MessageMetadata struct {
-	EditTimestamp   int64           `json:"edit_timestamp,omitempty"`
+	EditTimestamp int64 `json:"edit_timestamp,omitempty"`
+	// Default direct media meta. Used for blob media, whatsapp media and old XMA media
 	DirectMediaMeta json.RawMessage `json:"direct_media_meta,omitempty"`
+	// New XMA direct media meta.
+	XMADirectMediaMeta json.RawMessage `json:"xma_media_meta,omitempty"`
+	// Metadata for postponed fetching of XMA media.
+	XMAFetchMeta *XMAFetchMeta `json:"xma_fetch_meta,omitempty"`
+	XMAFetched   bool          `json:"xma_fetched,omitempty"`
+}
+
+type XMAFetchMeta struct {
+	TargetURL string `json:"target_url,omitempty"`
+	TargetID  int64  `json:"target_id,omitempty"`
+	IsStory   bool   `json:"is_story,omitempty"`
 }
 
 type GhostMetadata struct {
@@ -28,12 +40,14 @@ type GhostMetadata struct {
 }
 
 type UserLoginMetadata struct {
-	Platform   types.Platform       `json:"platform"`
-	Cookies    *cookies.Cookies     `json:"cookies"`
-	WADeviceID uint16               `json:"wa_device_id,omitempty"`
-	PushKeys   *pushcrypto.PushKeys `json:"push_keys,omitempty"`
-	LoginUA    string               `json:"login_ua,omitempty"`
-	IGID       string               `json:"igid,omitempty"`
+	Platform       types.Platform             `json:"platform"`
+	Cookies        *cookies.Cookies           `json:"cookies"`
+	WADeviceID     uint16                     `json:"wa_device_id,omitempty"`
+	PushKeys       *pushcrypto.PushKeys       `json:"push_keys,omitempty"`
+	LoginUA        string                     `json:"login_ua,omitempty"`
+	IGID           string                     `json:"igid,omitempty"`
+	NativeSession  *types.NativeSession       `json:"native_session,omitempty"`
+	NativePushKeys *pushcrypto.NativePushKeys `json:"native_push_keys,omitempty"`
 
 	// Thread backfill state
 	BackfillCompleted bool `json:"backfill_completed,omitempty"`

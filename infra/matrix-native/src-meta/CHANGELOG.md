@@ -1,3 +1,31 @@
+# v26.09
+
+* Bumped minimum Go version to 1.26.
+* Added support for downloading reels after bridging with the unresolved media
+  provisioning API.
+* Re-added periodic reconnects for Instagram bridge.
+* Changed message send errors on Instagram to only show the error message from
+  Instagram servers.
+* Added support for password login for Instagram.
+  * Note that this may still require a webview and can therefore only be used
+    via mautrix-manager, not bot commands.
+* Added support for push registrations for encrypted chats when logged in using
+  the Messenger Android flow.
+* Improved Messenger mobile login modes.
+
+# v26.08.1
+
+* Fixed connecting after a breaking change on the Messenger servers.
+
+# v26.08
+
+* Removed Instagram support from the mautrix-meta bridge.
+  Only mautrix-instagram can be used for Instagram now.
+* Added notices for calls from Instagram.
+* Improved iOS Messenger login mode and added Android Messenger as an option.
+* Fixed Instagram ghost profiles not being updated when receiving a message.
+* Fixed bridging edits from Instagram.
+
 # v26.07
 
 * Updated Docker image to Alpine 3.24.

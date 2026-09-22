@@ -39,7 +39,6 @@ import (
 
 	metaconnector "go.mau.fi/mautrix-meta/pkg/connector"
 	igconnector "go.mau.fi/mautrix-meta/pkg/igconnector"
-	metatypes "go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
 
 // metaBase holds the id/classification behaviour shared by both Meta networks;
@@ -86,16 +85,16 @@ func (metaBase) Bind(login *bridgev2.UserLogin) NetworkIdentity {
 	return NetworkIdentity{SelfIDs: []networkid.UserID{networkid.UserID(login.ID)}}
 }
 
-// metaNetwork = Facebook/Messenger via the messagix MetaConnector (mode-specific).
+// metaNetwork = Facebook/Messenger via the messagix MetaConnector. As of
+// mautrix-meta v26.09 this connector is Messenger-only (Instagram was removed
+// from it and lives in igconnector), so there is no mode to pin.
 type metaNetwork struct {
 	metaBase
-	mode metatypes.Platform
 }
 
 func messengerNetwork() metaNetwork {
 	return metaNetwork{
 		metaBase: metaBase{id: "messenger", flowID: metaconnector.FlowIDMessengerCookies, cmdPfx: "!fb", ghostPfx: "fb", suffix: " (FB)"},
-		mode:     metatypes.Messenger,
 	}
 }
 
@@ -106,9 +105,9 @@ func (n metaNetwork) NewConnector() (bridgev2.NetworkConnector, error) {
 	if err := yaml.Unmarshal([]byte(metaconnector.ExampleConfig), &c.Config); err != nil {
 		return nil, fmt.Errorf("seed meta config: %w", err)
 	}
-	// Pin this connector to one mode (Messenger).
-	c.Config.Mode = n.mode
-	c.Config.RawMode = strings.ToLower(n.id)
+	// mautrix-meta v26.09 removed Instagram from this connector — it is now
+	// hardcoded to Messenger (DisplayName "Facebook Messenger"), so the old
+	// Config.Mode/RawMode pinning is gone. Instagram runs on igconnector below.
 	return c, nil
 }
 

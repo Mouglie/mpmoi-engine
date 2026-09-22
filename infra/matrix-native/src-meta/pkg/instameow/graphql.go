@@ -60,6 +60,26 @@ func (c *Client) DeleteThread(ctx context.Context, req *slidetypes.DeleteThreadR
 	return makeGraphQLRequest[*slidetypes.DeleteThreadResponse](ctx, c, "IGDInboxInfoDeleteThreadDialogOffMsysMutation", req, true)
 }
 
+func (c *Client) LeaveGroup(ctx context.Context, req *slidetypes.LeaveThreadRequest) (*slidetypes.LeaveThreadResponse, error) {
+	return makeGraphQLRequest[*slidetypes.LeaveThreadResponse](ctx, c, "useIGDLeaveChatMutation", req, true)
+}
+
+func (c *Client) RemoveMember(ctx context.Context, req *slidetypes.RemoveMemberRequest) (*slidetypes.RemoveMemberResponse, error) {
+	return makeGraphQLRequest[*slidetypes.RemoveMemberResponse](ctx, c, "IGDRemoveFromGroupDialogItemOffMsysMutation", req, true)
+}
+
+func (c *Client) AddMembers(ctx context.Context, req *slidetypes.AddMembersRequest) (*slidetypes.AddMembersResponse, error) {
+	return makeGraphQLRequest[*slidetypes.AddMembersResponse](ctx, c, "IGDAddParticipantSubmitBarMutation", req, true)
+}
+
+func (c *Client) AddAdmins(ctx context.Context, req *slidetypes.ModifyAdminsRequest) (*slidetypes.AddAdminsResponse, error) {
+	return makeGraphQLRequest[*slidetypes.AddAdminsResponse](ctx, c, "IGDAddAdminDialogItemOffMsysMutation", req, true)
+}
+
+func (c *Client) RemoveAdmins(ctx context.Context, req *slidetypes.ModifyAdminsRequest) (*slidetypes.RemoveAdminsResponse, error) {
+	return makeGraphQLRequest[*slidetypes.RemoveAdminsResponse](ctx, c, "IGDRemoveAdminDialogItemOffMsysMutation", req, true)
+}
+
 func (c *Client) AcceptMessageRequest(ctx context.Context, req *slidetypes.AcceptMessageRequestRequest) (*slidetypes.AcceptMessageRequestResponse, error) {
 	return makeGraphQLRequest[*slidetypes.AcceptMessageRequestResponse](ctx, c, "useIGDirectAcceptMessageRequestMutation", req, true)
 }
@@ -104,6 +124,10 @@ func (c *Client) GetProfile(ctx context.Context, igid string) (*slidetypes.Profi
 	return makeGraphQLRequest[*slidetypes.ProfilePageResponse](ctx, c, "PolarisProfilePageContentQuery", slidetypes.MakeProfilePageRequest(igid), true)
 }
 
+func (c *Client) GetUserForNewDM(ctx context.Context, fbid int64) (*slidetypes.UserInfoResponse, error) {
+	return makeGraphQLRequest[*slidetypes.UserInfoResponse](ctx, c, "useIGDCreateOptimisticThreadUserQuery", &slidetypes.GetUserInfoByFBIDRequest{MessagingUserFBID: fbid}, true)
+}
+
 func (c *Client) SearchUsers(ctx context.Context, query string) (*slidetypes.SearchResponse, error) {
 	return makeGraphQLRequest[*slidetypes.SearchResponse](ctx, c, "IGDOmniPickerSearchResultsListQuery", slidetypes.SearchRequest{SearchText: query}, true)
 }
@@ -140,12 +164,14 @@ func makeGraphQLRequest[T any](ctx context.Context, c *Client, name string, req 
 	} else if allowReload && wrappedResp.ErrorCode == types.ErrPleaseReloadPage.ErrorCode {
 		zerolog.Ctx(ctx).Warn().Err(wrappedResp.AsError()).
 			Msg("Got please reload page error, reloading index and retrying")
-		reloadErr := c.ReloadIndex(ctx)
+		didReload, reloadErr := c.ReloadIndex(ctx)
 		if reloadErr != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to reload page to retry GraphQL request")
-		} else {
+		} else if didReload {
 			zerolog.Ctx(ctx).Debug().Msg("Successfully reloaded index, retrying GraphQL request")
 			return makeGraphQLRequest[T](ctx, c, name, req, false)
+		} else {
+			zerolog.Ctx(ctx).Debug().Msg("Didn't reload index, not retrying GraphQL request")
 		}
 	}
 	return wrappedResp.Data, wrappedResp.AsError()

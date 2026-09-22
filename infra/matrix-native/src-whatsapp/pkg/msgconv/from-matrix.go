@@ -36,6 +36,7 @@ import (
 	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/random"
+	cwebp "go.mau.fi/webp"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -149,7 +150,7 @@ func (mc *MessageConverter) ToWhatsApp(
 			}
 			lid := parsedID.Sender
 			if lid.Server == types.DefaultUserServer {
-				lid, err = client.Store.LIDs.GetLIDForPN(ctx, parsedID.Sender)
+				lid, err = client.Store.LIDs.GetLIDForPN(ctx, lid)
 				if err != nil {
 					return nil, nil, fmt.Errorf("failed to get LID for PN: %w", err)
 				}
@@ -476,10 +477,7 @@ func (mc *MessageConverter) convertToWebP(img []byte) ([]byte, int, error) {
 	}
 
 	var webpBuffer bytes.Buffer
-	// encodeWebP is platform-split: cgo libwebp (go.mau.fi/webp) on non-Windows,
-	// pure-Go VP8L (nativewebp) on Windows — see webp_cgo.go / webp_purego.go. This
-	// keeps the engine cross-compilable to windows/amd64 without a native libwebp.
-	if err = encodeWebP(&webpBuffer, decodedImg); err != nil {
+	if err = cwebp.Encode(&webpBuffer, decodedImg, nil); err != nil {
 		return img, 0, fmt.Errorf("failed to encode webp image: %w", err)
 	}
 

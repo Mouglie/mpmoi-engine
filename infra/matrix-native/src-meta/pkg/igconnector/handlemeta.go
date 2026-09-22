@@ -18,6 +18,7 @@ package igconnector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 
+	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -40,6 +42,7 @@ import (
 const (
 	DGWConnectionError        status.BridgeStateErrorCode = "ig-dgw-connection-error"
 	DGWConnectionUnauthorized status.BridgeStateErrorCode = "dgw-connection-unauthorized"
+	DGWMainStreamClosed       status.BridgeStateErrorCode = "dgw-main-stream-closed"
 	MetaCookieRemoved         status.BridgeStateErrorCode = "meta-cookie-removed"
 	MetaUserIDIsZero          status.BridgeStateErrorCode = "meta-user-id-is-zero"
 	MetaRedirectedToLoginPage status.BridgeStateErrorCode = "meta-redirected-to-login"
@@ -57,6 +60,7 @@ const (
 func init() {
 	status.BridgeStateHumanErrors.Update(status.BridgeStateErrorMap{
 		DGWConnectionError:        "Disconnected from server, trying to reconnect",
+		DGWMainStreamClosed:       "Unexpected repeated error connecting to Instagram server",
 		DGWConnectionUnauthorized: "Logged out, please relogin to continue",
 		MetaCookieRemoved:         "Logged out, please relogin to continue",
 		MetaUserIDIsZero:          "Logged out, please relogin to continue",
@@ -113,6 +117,13 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
 			errCode = DGWConnectionUnauthorized
 			retErr = fmt.Errorf("connection unauthorized; stop reconnects")
 			ic.permanentErrored.Store(true)
+			ic.cancelPeriodicReconnect()
+		} else if evt.FailureCount > 5 && errors.Is(evt.Error, instameow.ErrMainStreamClosed) {
+			stateEvt = status.StateUnknownError
+			errCode = DGWMainStreamClosed
+			retErr = fmt.Errorf("main stream closed too many times; stop reconnects")
+			ic.permanentErrored.Store(true)
+			ic.cancelPeriodicReconnect()
 		}
 		ic.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: stateEvt,
@@ -143,8 +154,9 @@ func (ic *IGClient) handleIGEvent(ctx context.Context, rawEvt slidetypes.ClientE
 	case *slidetypes.ReconnectionStateUpdate:
 		return ic.Main.DB.PutReconnectionState(ctx, ic.UserLogin.ID, evt.State)
 	case *slidetypes.ResnapshotRequired:
+		ic.cancelPeriodicReconnect()
 		_ = ic.doWaitMailboxProcessed(ctx)
-		go ic.FullReconnect(true)
+		go ic.FullReconnect(true, false)
 		return nil
 	case *slidetypes.Delta:
 		if err := ic.doWaitMailboxProcessed(ctx); err != nil {
@@ -249,6 +261,12 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 	case *slidetypes.DeleteThreadEvent, *slidetypes.DeleteMessageEvent, *slidetypes.DeleteReactionEvent,
 		*slidetypes.ParticipantLeaveEvent:
 		allowCreate = false
+	case *slidetypes.NewMessageEvent:
+		// Some messages (maybe specifically raven messages?) don't have the top-level thread ID set,
+		// so extract it from the message for finding the portal.
+		if d.ThreadIGID == "" && evt.Message != nil && evt.Message.ThreadFBID != "" {
+			d.ThreadIGID = evt.Message.ThreadFBID
+		}
 	case *slidetypes.AdminMessageEvent:
 		if ic.pendingGroupCreations.Has(evt.Message.OfflineThreadingID) {
 			log.Debug().
@@ -330,6 +348,12 @@ func (ic *IGClient) handleDelta(ctx context.Context, d *slidetypes.Delta) error 
 }
 
 func (ic *IGClient) makeMessageEventMeta(portalKey networkid.PortalKey, msg *slidetypes.Message, evtType bridgev2.RemoteEventType) simplevent.EventMeta {
+	if msg == nil {
+		return simplevent.EventMeta{
+			Type:      evtType,
+			PortalKey: portalKey,
+		}
+	}
 	return simplevent.EventMeta{
 		Type:         evtType,
 		PortalKey:    portalKey,

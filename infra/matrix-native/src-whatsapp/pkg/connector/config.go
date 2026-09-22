@@ -52,6 +52,8 @@ type Config struct {
 	DirectMediaAutoRequest      bool          `yaml:"direct_media_auto_request"`
 	InitialAutoReconnect        bool          `yaml:"initial_auto_reconnect"`
 	UseWhatsAppRetryStore       bool          `yaml:"use_whatsapp_retry_store"`
+	MaxMemberSync               int           `yaml:"max_member_sync"`
+	LazyAvatars                 bool          `yaml:"lazy_avatars"`
 
 	AnimatedSticker msgconv.AnimatedStickerConfig `yaml:"animated_sticker"`
 
@@ -129,6 +131,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "direct_media_auto_request")
 	helper.Copy(up.Bool, "initial_auto_reconnect")
 	helper.Copy(up.Bool, "use_whatsapp_retry_store")
+	helper.Copy(up.Int, "max_member_sync")
+	helper.Copy(up.Bool, "lazy_avatars")
 
 	helper.Copy(up.Str, "animated_sticker", "target")
 	helper.Copy(up.Int, "animated_sticker", "args", "width")
@@ -205,6 +209,7 @@ func (wa *WhatsAppConnector) GetConfig() (string, any, up.Upgrader) {
 			{"proxy"},
 			{"displayname_template"},
 			{"call_start_notices"},
+			{"animated_sticker"},
 			{"history_sync"},
 		},
 		Base: ExampleConfig,

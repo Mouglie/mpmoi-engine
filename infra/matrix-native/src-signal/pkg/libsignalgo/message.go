@@ -43,6 +43,7 @@ func Encrypt(ctx context.Context, plaintext []byte, forAddress, localAddress *Ad
 	)
 	runtime.KeepAlive(plaintext)
 	runtime.KeepAlive(forAddress)
+	runtime.KeepAlive(localAddress)
 	if signalFfiError != nil {
 		return nil, callbackCtx.wrapError(signalFfiError)
 	}
@@ -63,6 +64,7 @@ func Decrypt(ctx context.Context, message *Message, fromAddress, localAddress *A
 	)
 	runtime.KeepAlive(message)
 	runtime.KeepAlive(fromAddress)
+	runtime.KeepAlive(localAddress)
 	if signalFfiError != nil {
 		return nil, callbackCtx.wrapError(signalFfiError)
 	}
@@ -71,10 +73,10 @@ func Decrypt(ctx context.Context, message *Message, fromAddress, localAddress *A
 
 type Message struct {
 	nc  noCopy
-	ptr *C.SignalMessage
+	ptr *C.SignalSignalMessage
 }
 
-func wrapMessage(ptr *C.SignalMessage) *Message {
+func wrapMessage(ptr *C.SignalSignalMessage) *Message {
 	message := &Message{ptr: ptr}
 	runtime.SetFinalizer(message, (*Message).Destroy)
 	return message

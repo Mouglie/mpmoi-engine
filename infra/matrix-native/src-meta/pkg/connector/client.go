@@ -36,15 +36,16 @@ type MetaClient struct {
 	UserLogin *bridgev2.UserLogin
 	Ghost     *bridgev2.Ghost
 
-	stopHandlingTables  atomic.Pointer[context.CancelFunc]
-	initialTable        atomic.Pointer[table.LSTable]
-	initialTableHandled atomic.Bool
-	parsedTables        chan *parsedTable
-	backfillCollectors  map[int64]*BackfillCollector
-	backfillLock        sync.Mutex
-	connectLock         sync.Mutex
-	stopConnectAttempt  atomic.Pointer[context.CancelFunc]
-	permanentErrored    atomic.Bool
+	stopHandlingTables   atomic.Pointer[context.CancelFunc]
+	initialTable         atomic.Pointer[table.LSTable]
+	initialTableHandled  atomic.Bool
+	parsedTables         chan *parsedTable
+	backfillCollectors   map[int64]*BackfillCollector
+	backfillLock         sync.Mutex
+	connectLock          sync.Mutex
+	pushRegistrationLock sync.Mutex
+	stopConnectAttempt   atomic.Pointer[context.CancelFunc]
+	permanentErrored     atomic.Bool
 
 	editChannels *exsync.Map[string, chan *FBEditEvent]
 
@@ -81,6 +82,12 @@ func (m *MetaConnector) getMessagixConfig() *messagix.Config {
 
 func (m *MetaConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	loginMetadata := login.Metadata.(*metaid.UserLoginMetadata)
+	if err := validateNativeSession(loginMetadata.NativeSession); err != nil {
+		return err
+	}
+	if login.Client != nil {
+		login.Client.Disconnect()
+	}
 	c := &MetaClient{
 		Main:      m,
 		LoginMeta: loginMetadata,
@@ -150,6 +157,7 @@ func (m *MetaClient) ensureMessagixClient() {
 			m.Main.getMessagixConfig(),
 		)
 		m.Client.SetEventHandler(m.handleMetaEvent)
+		m.Client.MessengerLite.SetNativeSession(m.LoginMeta.NativeSession)
 	}
 }
 
@@ -157,7 +165,14 @@ func (m *MetaClient) ExportCredentials(ctx context.Context) any {
 	if m.Client == nil {
 		return nil
 	}
-	return m.Client.GetCookies()
+	if m.LoginMeta.NativeSession == nil {
+		return m.Client.GetCookies()
+	}
+	return &metaCredentials{
+		Platform:      m.LoginMeta.Platform,
+		Cookies:       m.Client.GetCookies(),
+		NativeSession: m.LoginMeta.NativeSession,
+	}
 }
 
 func (m *MetaClient) Connect(ctx context.Context) {
@@ -169,9 +184,7 @@ func (m *MetaClient) Connect(ctx context.Context) {
 	if m.metaState.StateEvent == "" && m.waState.StateEvent == "" {
 		// Ensure both states start at CONNECTING now
 		m.metaState.StateEvent = status.StateConnecting
-		if m.LoginMeta.Platform.IsMessenger() {
-			m.waState.StateEvent = status.StateConnecting
-		}
+		m.waState.StateEvent = status.StateConnecting
 		m.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
 	}
 	retryCtx, cancel := context.WithCancel(ctx)
@@ -185,6 +198,13 @@ func (m *MetaClient) Connect(ctx context.Context) {
 const MaxConnectRetries = 10
 
 func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts int) {
+	if m.LoginMeta.Platform == types.Instagram {
+		m.UserLogin.BridgeState.Send(status.BridgeState{
+			StateEvent: status.StateBadCredentials,
+			Error:      IGNotSupported,
+		})
+		return
+	}
 	m.ensureMessagixClient()
 	cli := m.Client
 	if cli == nil {
@@ -258,31 +278,33 @@ func (m *MetaClient) connectWithRetry(retryCtx, ctx context.Context, attempts in
 				zerolog.Ctx(ctx).Err(err).Msg("Failed to save user login after clearing cookies")
 			}
 		} else if errors.Is(err, httpclient.ErrChallengeRequired) {
+			// Note: this is probably exclusive to instagram
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      IGChallengeRequired,
+				Error:      FBChallengeRequired,
 				UserAction: status.UserActionRestart,
+				Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 			})
 		} else if errors.Is(err, httpclient.ErrAccountSuspended) {
+			// Note: this is probably exclusive to instagram
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      IGAccountSuspended,
+				Error:      FBAccountSuspended,
+				Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 			})
 		} else if errors.Is(err, httpclient.ErrCheckpointRequired) {
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
 				Error:      FBCheckpointRequired,
 				UserAction: status.UserActionRestart,
+				Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 			})
 		} else if errors.Is(err, httpclient.ErrConsentRequired) {
-			code := IGConsentRequired
-			if m.LoginMeta.Platform.IsMessenger() {
-				code = FBConsentRequired
-			}
 			m.UserLogin.BridgeState.Send(status.BridgeState{
 				StateEvent: status.StateBadCredentials,
-				Error:      code,
+				Error:      FBConsentRequired,
 				UserAction: status.UserActionRestart,
+				Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 			})
 		} else if lsErr := (&types.ErrorResponse{}); errors.As(err, &lsErr) {
 			stateEvt := status.StateUnknownError
@@ -347,13 +369,6 @@ func (m *MetaClient) connectWithTable(ctx context.Context, initialTable *table.L
 	}
 	m.UserLogin.RemoteName = currentUser.GetName()
 	m.UserLogin.RemoteProfile.Name = currentUser.GetName()
-	if !m.LoginMeta.Platform.IsMessenger() {
-		m.UserLogin.RemoteProfile.Username = currentUser.GetUsername()
-		// Instagram users may not have a displayname
-		if m.UserLogin.RemoteName == "" {
-			m.UserLogin.RemoteName = currentUser.GetUsername()
-		}
-	}
 	m.UserLogin.RemoteProfile.Avatar = m.Ghost.AvatarMXC
 
 	m.initialTable.Store(initialTable)
@@ -454,9 +469,11 @@ func (m *MetaClient) connectE2EE() error {
 	if m.WADevice == nil {
 		isNew = true
 		m.WADevice = m.Main.DeviceStore.NewDevice()
-	}
-	if suggested := m.Client.MessengerLite.GetSuggestedDeviceID(); suggested != uuid.Nil {
-		m.WADevice.FacebookUUID = suggested
+		if session := m.LoginMeta.NativeSession; session != nil {
+			m.WADevice.FacebookUUID = session.DeviceID
+		} else if suggested := m.Client.MessengerLite.GetSuggestedDeviceID(); suggested != uuid.Nil {
+			m.WADevice.FacebookUUID = suggested
+		}
 	}
 	m.Client.SetDevice(m.WADevice)
 
@@ -484,7 +501,7 @@ func (m *MetaClient) connectE2EE() error {
 	if m.Main.Config.ProxyE2EE && m.Main.Config.Proxy != "" {
 		m.E2EEClient.SetProxyAddress(m.Main.Config.Proxy)
 	}
-	if bridgev2.PortalEventBuffer == 0 {
+	if m.Main.Bridge.Config.PortalEventBuffer == 0 {
 		m.E2EEClient.SynchronousAck = true
 		m.E2EEClient.EnableDecryptedEventBuffer = true
 	}

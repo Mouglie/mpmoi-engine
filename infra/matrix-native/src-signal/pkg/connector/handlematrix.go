@@ -39,7 +39,7 @@ import (
 	"go.mau.fi/mautrix-signal/pkg/libsignalgo"
 	"go.mau.fi/mautrix-signal/pkg/signalid"
 	"go.mau.fi/mautrix-signal/pkg/signalmeow"
-	signalpb "go.mau.fi/mautrix-signal/pkg/signalmeow/protobuf"
+	"go.mau.fi/mautrix-signal/pkg/signalmeow/protobuf/signalpb"
 )
 
 var (
@@ -180,10 +180,46 @@ func (s *SignalClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.Matri
 	if err != nil {
 		return bridgev2.WrapErrorInStatus(err).WithSendNotice(true)
 	}
+	prevID := msg.EditTarget.ID
 	msg.EditTarget.ID = signalid.MakeMessageID(s.Client.Store.ACI, ts)
 	msg.EditTarget.Metadata = &signalid.MessageMetadata{ContainsAttachments: len(converted.Attachments) > 0}
 	msg.EditTarget.EditCount++
+	if prevID != msg.EditTarget.ID {
+		err = s.Main.Bridge.DB.DoTxn(ctx, nil, func(ctx context.Context) error {
+			err = s.Main.Bridge.DB.Message.Update(ctx, msg.EditTarget)
+			if err != nil {
+				return err
+			}
+			err = saveEditStub(ctx, s.Main.Bridge, prevID, msg.EditTarget)
+			if err != nil {
+				return fmt.Errorf("failed to save edit stub: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).
+				Str("prev_message_id", string(prevID)).
+				Str("message_id", string(msg.EditTarget.ID)).
+				Msg("Failed to save message after editing")
+		}
+	}
 	return nil
+}
+
+// saveEditStub saves a placeholder message row pointing at the pre-edit ID of a message, such that
+// duplicate checks on incoming edits find it and are dropped. This is necessary because the first
+// time we see an edit it modifies the ID in place.
+func saveEditStub(ctx context.Context, bridge *bridgev2.Bridge, prevID networkid.MessageID, target *database.Message) error {
+	stub := &database.Message{
+		ID:         prevID,
+		PartID:     editStubPartID,
+		Room:       target.Room,
+		SenderID:   target.SenderID,
+		SenderMXID: target.SenderMXID,
+		Timestamp:  target.Timestamp,
+	}
+	stub.SetFakeMXID()
+	return bridge.DB.Message.Insert(ctx, stub)
 }
 
 func (s *SignalClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {

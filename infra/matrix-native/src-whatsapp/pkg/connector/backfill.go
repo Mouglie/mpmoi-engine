@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exmaps"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -228,30 +229,32 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 		} else {
 			totalMessageCount += len(conv.GetMessages())
 		}
-		if jid.Server == types.HiddenUserServer {
-			pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid)
+		if jid.Server == types.DefaultUserServer {
+			lid, err := wa.GetStore().LIDs.GetLIDForPN(ctx, jid)
 			if err != nil {
-				log.Err(err).Stringer("lid", jid).Msg("Failed to get PN for LID in history sync")
-			} else if pn.IsEmpty() {
-				log.Warn().Stringer("lid", jid).Msg("No PN found for LID in history sync")
+				log.Err(err).Stringer("pn", jid).Msg("Failed to get LID for phone number in history sync")
+			} else if lid.IsEmpty() {
+				log.Warn().Stringer("pn", jid).Msg("No LID found for phone number in history sync")
 			} else {
 				log.Debug().
-					Stringer("lid", jid).
-					Stringer("pn", pn).
-					Msg("Rerouting LID DM to phone number in history sync")
-				jid = pn
+					Stringer("lid", lid).
+					Stringer("pn", jid).
+					Msg("Rerouting phone number DM to LID in history sync")
+				jid = lid
 			}
 		}
 		log.UpdateContext(func(c zerolog.Context) zerolog.Context {
 			return c.Stringer("chat_jid", jid)
 		})
 
-		var minTime, maxTime, firstItemTime, lastItemTime time.Time
-		var minTimeIndex, maxTimeIndex int
+		var firstItemTime, lastItemTime time.Time
 
 		ignoredTypes := 0
-		messages := make([]*wadb.HistorySyncMessageTuple, 0, len(conv.GetMessages()))
-		for i, rawMsg := range conv.GetMessages() {
+		rawMessages := conv.GetMessages()
+		messages := make([]*wadb.HistorySyncMessageTuple, 0, len(rawMessages))
+		allowClamp := conv.GetCommentsCount() == 0
+		var newerTS uint64
+		for i, rawMsg := range rawMessages {
 			// Don't store messages that will just be skipped.
 			msgEvt, err := wa.Client.ParseWebMessage(jid, rawMsg.GetMessage())
 			if err != nil {
@@ -269,20 +272,30 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 				firstItemTime = msgEvt.Info.Timestamp
 			}
 			lastItemTime = msgEvt.Info.Timestamp
-			if minTime.IsZero() || msgEvt.Info.Timestamp.Before(minTime) {
-				minTime = msgEvt.Info.Timestamp
-				minTimeIndex = i
-			}
-			if maxTime.IsZero() || msgEvt.Info.Timestamp.After(maxTime) {
-				maxTime = msgEvt.Info.Timestamp
-				maxTimeIndex = i
-			}
 
 			msgType := getMessageType(msgEvt.Message)
 			if msgType == "ignore" || strings.HasPrefix(msgType, "unknown_protocol_") {
 				ignoredTypes++
 				continue
 			}
+			// Comments (replies) in announcement groups are not ordered by timestamp, so don't clamp them.
+			if rawMsg.GetMessage().GetCommentMetadata().GetCommentParentKey() != nil {
+				allowClamp = false
+			}
+			// WhatsApp has bugs where some random messages will have timestamps decades in the future.
+			// To ensure they don't mess up our ordering, require timestamps of older messages to be
+			// before the previous (newer) message.
+			if currentTS := rawMsg.GetMessage().GetMessageTimestamp(); newerTS > 0 && allowClamp && currentTS > newerTS {
+				log.Warn().
+					Time("current_ts", time.Unix(int64(currentTS), 0)).
+					Time("prev_ts", time.Unix(int64(newerTS), 0)).
+					Int("msg_index", i).
+					Str("msg_id", rawMsg.GetMessage().GetKey().GetID()).
+					Msg("Clamping message timestamp")
+				rawMsg.Message.MessageTimestamp = ptr.Ptr(newerTS)
+				msgEvt.Info.Timestamp = time.Unix(int64(newerTS), 0)
+			}
+			newerTS = rawMsg.GetMessage().GetMessageTimestamp()
 			marshaled, err := proto.Marshal(rawMsg)
 			if err != nil {
 				log.Warn().Err(err).
@@ -297,13 +310,8 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 		log.Debug().
 			Int("wrapped_count", len(messages)).
 			Int("ignored_msg_type_count", ignoredTypes).
-			Time("lowest_time", minTime).
-			Int("lowest_time_index", minTimeIndex).
-			Time("highest_time", maxTime).
-			Int("highest_time_index", maxTimeIndex).
 			Time("first_item_time", firstItemTime).
 			Time("last_item_time", lastItemTime).
-			Bool("highest_time_mismatch", firstItemTime != maxTime).
 			Dict("metadata", zerolog.Dict().
 				Uint32("ephemeral_expiration", conv.GetEphemeralExpiration()).
 				Int64("ephemeral_setting_timestamp", conv.GetEphemeralSettingTimestamp()).
@@ -319,7 +327,7 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 			Msg("Collected messages to save from history sync conversation")
 
 		if len(messages) > 0 {
-			err = wa.Main.DB.Conversation.Put(ctx, wadb.NewConversation(wa.UserLogin.ID, jid, conv, maxTime))
+			err = wa.Main.DB.Conversation.Put(ctx, wadb.NewConversation(wa.UserLogin.ID, jid, conv, firstItemTime))
 			if err != nil {
 				if stopOnError {
 					return fmt.Errorf("failed to save conversation metadata for %s: %w", jid, err)
@@ -474,6 +482,9 @@ func (wa *WhatsAppClient) FetchMessages(ctx context.Context, params bridgev2.Fet
 	if err != nil {
 		return nil, err
 	}
+	if portalJID.Server == types.DefaultUserServer {
+		zerolog.Ctx(ctx).Warn().Stringer("portal_jid", portalJID).Msg("FetchMessages called for phone number portal")
+	}
 	var markRead bool
 	var startTime, endTime *time.Time
 	var conv *wadb.Conversation
@@ -521,6 +532,7 @@ func (wa *WhatsAppClient) FetchMessages(ctx context.Context, params bridgev2.Fet
 		return nil, fmt.Errorf("failed to load messages from database: %w", err)
 	} else if len(messages) == 0 || (len(messages) == 1 && anchorID != "" && messages[0].GetKey().GetID() == anchorID) {
 		wa.deleteHistorySyncMessages(ctx, portalJID, 0, 0)
+		hasMore = hasMore && params.AnchorMessage != nil
 		if hasMore && !params.AllowSlowFetch {
 			return &bridgev2.FetchMessagesResponse{
 				MoreRequiresSlowFetch: true,
@@ -528,7 +540,7 @@ func (wa *WhatsAppClient) FetchMessages(ctx context.Context, params bridgev2.Fet
 				Forward:               params.Forward,
 			}, nil
 		} else if hasMore {
-			return wa.fetchMessagesFromPhone(ctx, params)
+			return wa.fetchMessagesFromPhone(ctx, portalJID, params)
 		}
 		return &bridgev2.FetchMessagesResponse{
 			HasMore: false,
@@ -590,10 +602,14 @@ func (wa *WhatsAppClient) convertHistorySyncMessages(
 	messages []*waWeb.WebMessageInfo,
 	explodeOnError bool,
 ) (*bridgev2.FetchMessagesResponse, error) {
+	if wa.Client == nil {
+		return nil, bridgev2.ErrNotLoggedIn
+	}
 	oldestTS := messages[len(messages)-1].GetMessageTimestamp()
 	newestTS := messages[0].GetMessageTimestamp()
 	convertedMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	var mediaRequests []*wadb.MediaRequest
+	dups := make(exmaps.Set[networkid.MessageID])
 	for i, msg := range messages {
 		evt, err := wa.Client.ParseWebMessage(portalJID, msg)
 		if err != nil {
@@ -617,10 +633,18 @@ func (wa *WhatsAppClient) convertHistorySyncMessages(
 				continue
 			}
 		}
+		if !wa.ensureAltJIDs(ctx, &evt.Info.MessageSource, false) {
+			return nil, fmt.Errorf("failed to ensure alt JIDs for message %s", evt.Info.ID)
+		}
 		isViewOnce := evt.IsViewOnce || evt.IsViewOnceV2 || evt.IsViewOnceV2Extension
 		converted, mediaReq := wa.convertHistorySyncMessage(
 			ctx, portal, &evt.Info, evt.Message, evt.RawMessage, isViewOnce, msg.Reactions,
 		)
+		// This is a hack to remove duplicates where the same message is inserted with both the LID and phone number sender
+		// TODO prevent those being inserted in the first place instead of hacking around it here
+		if !dups.Add(converted.ID) {
+			continue
+		}
 		convertedMessages = append(convertedMessages, converted)
 		if mediaReq != nil {
 			mediaRequests = append(mediaRequests, mediaReq)
@@ -651,7 +675,7 @@ func (wa *WhatsAppClient) convertHistorySyncMessages(
 	}, nil
 }
 
-func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, portalJID types.JID, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
 	if params.AnchorMessage == nil {
 		return nil, fmt.Errorf("anchor message is required to fetch messages from phone")
 	}
@@ -663,9 +687,9 @@ func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, params bri
 	msgID := wa.Client.GenerateMessageID()
 	reqData := wa.Client.BuildHistorySyncRequest(&types.MessageInfo{
 		MessageSource: types.MessageSource{
-			Chat:     parsed.Chat,
+			Chat:     portalJID,
 			Sender:   parsed.Sender,
-			IsFromMe: parsed.Sender.ToNonAD() == wa.JID.ToNonAD() || parsed.Sender.ToNonAD() == wa.Device.GetLID().ToNonAD(),
+			IsFromMe: wa.IsOwnJID(parsed.Sender),
 			IsGroup:  parsed.Chat.Server == types.GroupServer,
 		},
 		ID:        parsed.ID,
@@ -673,6 +697,7 @@ func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, params bri
 	}, 50)
 	zerolog.Ctx(ctx).Debug().
 		Str("request_msg_id", msgID).
+		Stringer("portal_jid", portalJID).
 		Any("anchor_msg_parsed", parsed).
 		Any("request_data", reqData).
 		Msg("Sending history sync request")
@@ -700,6 +725,20 @@ func (wa *WhatsAppClient) handleOnDemandHistorySync(ctx context.Context, blob *w
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Str("jid", conv.GetID()).Msg("Failed to parse portal JID")
 			continue
+		}
+		if portalJID.Server == types.DefaultUserServer {
+			lid, err := wa.GetStore().LIDs.GetLIDForPN(ctx, portalJID)
+			if err != nil {
+				zerolog.Ctx(ctx).Err(err).Stringer("lid", portalJID).Msg("Failed to get LID for phone number in on-demand history sync")
+			} else if lid.IsEmpty() {
+				zerolog.Ctx(ctx).Warn().Stringer("lid", portalJID).Msg("No LID found for phone number in on-demand history sync")
+			} else {
+				zerolog.Ctx(ctx).Debug().
+					Stringer("lid", lid).
+					Stringer("pn", portalJID).
+					Msg("Rerouting phone number DM to LID in on-demand history sync")
+				portalJID = lid
+			}
 		}
 		portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(portalJID))
 		if err != nil {
@@ -749,11 +788,12 @@ func (wa *WhatsAppClient) convertHistorySyncMessage(
 	}
 	// TODO use proper intent
 	intent := wa.Main.Bridge.Bot
+	msgID := waid.MakeMessageIDWithAltSender(info.Chat, info.Sender, info.SenderAlt, info.ID)
 	wrapped := &bridgev2.BackfillMessage{
-		ConvertedMessage: wa.Main.MsgConv.ToMatrix(ctx, portal, wa.Client, intent, msg, rawMsg, info, nil, isViewOnce, true, nil),
-		Sender:           wa.makeEventSender(ctx, info.Sender),
-		ID:               waid.MakeMessageID(info.Chat, info.Sender, info.ID),
-		TxnID:            networkid.TransactionID(waid.MakeMessageID(info.Chat, info.Sender, info.ID)),
+		ConvertedMessage: wa.Main.MsgConv.ToMatrix(ctx, portal, wa.Client, intent, msg, rawMsg, info, isViewOnce, true, nil),
+		Sender:           wa.makeEventSender(ctx, pickLID(info.Sender, info.SenderAlt)),
+		ID:               msgID,
+		TxnID:            networkid.TransactionID(msgID),
 		Timestamp:        info.Timestamp,
 		StreamOrder:      info.Timestamp.Unix(),
 		Reactions:        make([]*bridgev2.BackfillReaction, 0, len(reactions)),
@@ -762,10 +802,10 @@ func (wa *WhatsAppClient) convertHistorySyncMessage(
 	for _, reaction := range reactions {
 		var sender types.JID
 		if reaction.GetKey().GetFromMe() {
-			sender = wa.JID
+			sender = wa.GetLID()
 		} else if reaction.GetKey().GetParticipant() != "" {
 			sender, _ = types.ParseJID(*reaction.Key.Participant)
-		} else if info.Chat.Server == types.DefaultUserServer || info.Chat.Server == types.BotServer {
+		} else if info.Chat.Server == types.DefaultUserServer || info.Chat.Server == types.HiddenUserServer || info.Chat.Server == types.BotServer {
 			sender = info.Chat
 		}
 		if sender.IsEmpty() {

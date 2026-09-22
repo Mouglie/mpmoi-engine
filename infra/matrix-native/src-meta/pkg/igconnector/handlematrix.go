@@ -102,15 +102,9 @@ func (ic *IGClient) ensureIGIDDirect(ctx context.Context, fbid int64) (string, e
 }
 
 func (ic *IGClient) fetchIGIDsDirect(ctx context.Context, fbid int64) (*instameow.ThreadIGIDs, error) {
-	resp, err := ic.Client.FetchThreadIDs(ctx, fbid)
+	res, err := ic.Client.FetchThreadID(ctx, fbid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch IGIDs: %w", err)
-	}
-	res, ok := resp[fbid]
-	if !ok {
-		return nil, fmt.Errorf("server didn't return route definition for %d", fbid)
-	} else if res == nil {
-		return nil, fmt.Errorf("server returned nil route definition for %d", fbid)
 	}
 	err = ic.Main.DB.PutFBIDForIGThread(ctx, res.LongID, fbid, ic.UserLogin.ID)
 	if err != nil {
@@ -355,11 +349,23 @@ func (ic *IGClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridge
 
 func (ic *IGClient) HandleMatrixDeleteChat(ctx context.Context, chat *bridgev2.MatrixDeleteChat) error {
 	meta, err := ic.ensureIGID(ctx, chat.Portal)
-	if err != nil {
-		// TODO treat 404 as success? (thread already deleted)
+	if errors.Is(err, instameow.ErrThreadNotFound) {
+		zerolog.Ctx(ctx).Debug().Err(err).Msg("Ignoring thread not found error on delete chat request")
+		return nil
+	} else if err != nil {
 		return err
 	}
-
+	if chat.Portal.RoomType != database.RoomTypeDM {
+		memberInfo, err := ic.Main.Bridge.Matrix.GetMemberInfo(ctx, chat.Portal.MXID, ic.UserLogin.UserMXID)
+		if err != nil {
+			return fmt.Errorf("failed to get own member info: %w", err)
+		} else if memberInfo.Membership == event.MembershipJoin {
+			_, err = ic.Client.LeaveGroup(ctx, &slidetypes.LeaveThreadRequest{ThreadID: meta.IGID})
+			if err != nil {
+				zerolog.Ctx(ctx).Err(err).Msg("Failed to leave group on delete chat request")
+			}
+		}
+	}
 	_, err = ic.Client.DeleteThread(ctx, &slidetypes.DeleteThreadRequest{
 		ThreadID:   meta.IGID,
 		MarkAsSpam: false,
@@ -388,8 +394,8 @@ func (ic *IGClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.Matr
 	}
 	// Note: technically this should use the IGID, but only groups can be renamed
 	// and the IGID is always the same as the FB thread key there.
-	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
-	err := ic.Client.EditGroupTitle(ctx, strconv.FormatInt(threadID, 10), msg.Content.Name)
+	threadID := strconv.FormatInt(metaid.ParseFBPortalID(msg.Portal.ID), 10)
+	err := ic.Client.EditGroupTitle(ctx, threadID, msg.Content.Name)
 	return err == nil, err
 }
 
@@ -397,9 +403,11 @@ func (ic *IGClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.Ma
 	if msg.Portal.RoomType == database.RoomTypeDM {
 		return false, fmt.Errorf("changing avatar not supported in DMs")
 	}
-	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
+	// Note: technically this should use the IGID, but only groups can have avatars
+	// and the IGID is always the same as the FB thread key there.
+	threadID := strconv.FormatInt(metaid.ParseFBPortalID(msg.Portal.ID), 10)
 	if msg.Content.URL == "" {
-		err := ic.Client.RemoveGroupAvatar(ctx, strconv.FormatInt(threadID, 10))
+		err := ic.Client.RemoveGroupAvatar(ctx, threadID)
 		if err != nil {
 			return false, fmt.Errorf("failed to remove Instagram avatar: %w", err)
 		}
@@ -409,7 +417,7 @@ func (ic *IGClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.Ma
 	if err != nil {
 		return false, fmt.Errorf("failed to download avatar: %w", err)
 	}
-	err = ic.Client.EditGroupAvatar(ctx, strconv.FormatInt(threadID, 10), data)
+	err = ic.Client.EditGroupAvatar(ctx, threadID, data)
 	if err != nil {
 		return false, fmt.Errorf("failed to set Instagram avatar: %w", err)
 	}
@@ -417,9 +425,16 @@ func (ic *IGClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.Ma
 }
 
 func (ic *IGClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
-	/*if msg.Portal.RoomType == database.RoomTypeDM {
+	if msg.Type.IsSelf && msg.OrigSender != nil {
+		return nil, nil
+	}
+	if msg.Portal.RoomType == database.RoomTypeDM {
 		return nil, errors.New("cannot change members for DM")
 	}
+
+	// Note: technically this should use the IGID, but only groups can have member changes
+	// and the IGID is always the same as the FB thread key there.
+	threadID := strconv.FormatInt(metaid.ParseFBPortalID(msg.Portal.ID), 10)
 
 	var targetID int64
 	switch target := msg.Target.(type) {
@@ -433,30 +448,32 @@ func (ic *IGClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.Ma
 	if targetID == 0 {
 		return nil, fmt.Errorf("invalid target user ID")
 	}
+	targetIGID, err := ic.Main.DB.GetIGUserForFBID(ctx, targetID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get IGID for target user: %w", err)
+	} else if targetIGID == "" {
+		return nil, fmt.Errorf("target user IGID not found")
+	}
 
-	portalMeta := msg.Portal.Metadata.(*metaid.PortalMetadata)
-	threadID := metaid.ParseFBPortalID(msg.Portal.ID)
-	var task socket.Task
 	switch msg.Type {
 	case bridgev2.Invite:
-		task = &socket.AddParticipantsTask{
-			ThreadKey:  threadID,
-			ContactIDs: []int64{targetID},
-			SyncGroup:  1,
-		}
+		// TODO sync with thread info?
+		//var resp *slidetypes.AddMembersResponse
+		_, err = ic.Client.AddMembers(ctx, slidetypes.MakeAddMembersRequest(threadID, targetIGID))
 	case bridgev2.Kick:
-		task = &socket.RemoveParticipantTask{
-			ThreadID:  threadID,
-			ContactID: targetID,
-		}
+		_, err = ic.Client.RemoveMember(ctx, &slidetypes.RemoveMemberRequest{
+			ThreadID: threadID,
+			UserIGID: targetIGID,
+		})
+	case bridgev2.Leave:
+		_, err = ic.Client.LeaveGroup(ctx, &slidetypes.LeaveThreadRequest{ThreadID: threadID})
 	default:
-		return nil, nil
+		return &bridgev2.MatrixMembershipResult{}, fmt.Errorf("not implemented")
 	}
-	_, err := m.Client.ExecuteTasks(ctx, task)
 	if err != nil {
 		return nil, err
-	}*/
-	return &bridgev2.MatrixMembershipResult{}, fmt.Errorf("not implemented")
+	}
+	return &bridgev2.MatrixMembershipResult{}, nil
 }
 
 func (ic *IGClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {

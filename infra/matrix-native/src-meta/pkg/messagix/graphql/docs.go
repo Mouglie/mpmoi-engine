@@ -9,7 +9,7 @@ type GraphQLDoc struct {
 	Jsessw string
 }
 
-const IGDSlideDeltaProcessorQuery = "28239922265610241"
+const IGDSlideDeltaProcessorQuery = "27931342966497053"
 const IGDTypingIndicatorClientSubscription = "27563068933278040"
 
 var GraphQLDocs = map[string]GraphQLDoc{
@@ -87,8 +87,12 @@ var GraphQLDocs = map[string]GraphQLDoc{
 		FriendlyName: "IGDMessageUnsendDialogOffMsysMutation",
 	},
 	"IGDRemoveFromGroupDialogItemOffMsysMutation": {
-		DocID:        "26749775594683932",
+		DocID:        "27974649738797533",
 		FriendlyName: "IGDRemoveFromGroupDialogItemOffMsysMutation",
+	},
+	"IGDAddParticipantSubmitBarMutation": {
+		DocID:        "27335198219492328",
+		FriendlyName: "IGDAddParticipantSubmitBarMutation",
 	},
 	"IGDAddAdminDialogItemOffMsysMutation": {
 		DocID:        "35563011113312213",
@@ -141,6 +145,14 @@ var GraphQLDocs = map[string]GraphQLDoc{
 	"useCreateOpenGroupThreadOffMsysMutation": {
 		DocID:        "27529949946640544",
 		FriendlyName: "useCreateOpenGroupThreadOffMsysMutation",
+	},
+	"useIGDCreateOptimisticThreadUserQuery": {
+		DocID:        "35274961328786258",
+		FriendlyName: "useIGDCreateOptimisticThreadUserQuery",
+	},
+	"useIGDLeaveChatMutation": {
+		DocID:        "27243106098639056",
+		FriendlyName: "useIGDLeaveChatMutation",
 	},
 }
 

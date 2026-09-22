@@ -18,7 +18,6 @@ import (
 
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
-	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/mautrix-meta/pkg/metaid"
@@ -38,12 +37,12 @@ const (
 	MetaConnectError          status.BridgeStateErrorCode = "meta-connect-error"
 	MetaGraphQLError          status.BridgeStateErrorCode = "meta-graphql-error"
 	MetaTransientDisconnect   status.BridgeStateErrorCode = "meta-transient-disconnect"
-	IGChallengeRequired       status.BridgeStateErrorCode = "ig-challenge-required"
-	IGAccountSuspended        status.BridgeStateErrorCode = "ig-account-suspended"
-	IGConsentRequired         status.BridgeStateErrorCode = "ig-consent-required"
+	FBChallengeRequired       status.BridgeStateErrorCode = "fb-challenge-required"
+	FBAccountSuspended        status.BridgeStateErrorCode = "fb-account-suspended"
 	FBConsentRequired         status.BridgeStateErrorCode = "fb-consent-required"
 	FBCheckpointRequired      status.BridgeStateErrorCode = "fb-checkpoint-required"
 	MetaProxyUpdateFail       status.BridgeStateErrorCode = "meta-proxy-update-fail"
+	IGNotSupported            status.BridgeStateErrorCode = "meta-ig-not-supported"
 )
 
 func init() {
@@ -55,13 +54,13 @@ func init() {
 		MetaUserIDIsZero:          "Logged out, please relogin to continue",
 		MetaRedirectedToLoginPage: "Logged out, please relogin to continue",
 		MetaNotLoggedIn:           "Logged out, please relogin to continue",
-		IGAccountSuspended:        "Logged out, please check the Instagram website to continue",
-		IGChallengeRequired:       "Challenge required, please check the Instagram website to continue",
-		IGConsentRequired:         "Consent required, please check the Instagram website to continue",
+		FBAccountSuspended:        "Logged out, please check the Facebook website to continue",
+		FBChallengeRequired:       "Challenge required, please check the Facebook website to continue",
 		FBConsentRequired:         "Consent required, please check the Facebook website to continue",
 		FBCheckpointRequired:      "Checkpoint required, please check the Facebook website to continue",
 		MetaConnectError:          "Unknown connection error",
 		MetaProxyUpdateFail:       "Failed to update proxy",
+		IGNotSupported:            "This bridge no longer supports Instagram",
 	})
 }
 
@@ -79,10 +78,8 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		log.Debug().Msg("Initial connect to Meta socket completed")
 		m.permanentErrored.Store(false)
 		m.connectWaiter.Set()
-		if m.LoginMeta.Platform.IsMessenger() {
-			m.firstE2EEConnectDone = true
-			go m.tryConnectE2EE(false)
-		}
+		m.firstE2EEConnectDone = true
+		go m.tryConnectE2EE(false)
 		m.metaState = status.BridgeState{StateEvent: status.StateConnected}
 		m.UserLogin.BridgeState.Send(m.metaState)
 		if tbl := m.initialTable.Swap(nil); tbl != nil {
@@ -104,7 +101,7 @@ func (m *MetaClient) handleMetaEvent(ctx context.Context, rawEvt any) {
 		}
 		m.UserLogin.BridgeState.Send(m.metaState)
 	case *messagix.ReconnectedEvent:
-		if !m.firstE2EEConnectDone && m.LoginMeta.Platform.IsMessenger() {
+		if !m.firstE2EEConnectDone {
 			m.firstE2EEConnectDone = true
 			go m.tryConnectE2EE(false)
 		}
@@ -200,60 +197,6 @@ func (m *MetaClient) handleParsedTable(ctx context.Context, isInitial bool, tbl 
 	}
 	if ctx.Err() != nil {
 		return
-	}
-	if m.Client.GetPlatform() == types.Instagram {
-		contactsWithoutIGID := []int64{}
-		for _, contact := range tbl.LSVerifyContactRowExists {
-			if ctx.Err() != nil {
-				return
-			}
-			igid, err := m.Main.DB.GetIGUserForFBID(ctx, contact.GetFBID())
-			if err != nil {
-				zerolog.Ctx(ctx).Warn().Err(err).Msg("Error getting IG user for FBID")
-				continue
-			}
-			if igid == "" {
-				contactsWithoutIGID = append(contactsWithoutIGID, contact.GetFBID())
-			}
-		}
-		go func() {
-			for len(contactsWithoutIGID) > 0 {
-				// Web client seems to fetch in groups of up to five
-				batchSize := 5
-				if len(contactsWithoutIGID) < batchSize {
-					batchSize = len(contactsWithoutIGID)
-				}
-				contactsBatch := contactsWithoutIGID[:batchSize]
-				tasks := []socket.Task{}
-				for _, contact := range contactsBatch {
-					tasks = append(tasks, &socket.GetContactsFullTask{
-						ContactID: contact,
-					})
-				}
-				resp, err := m.Client.ExecuteTasks(ctx, tasks...)
-				if err != nil {
-					zerolog.Ctx(ctx).Warn().Err(err).Ints64("fbids", contactsBatch).Msg("user info request failed")
-					return
-				}
-				for _, info := range resp.LSDeleteThenInsertIGContactInfo {
-					err := m.Main.DB.PutFBIDForIGUser(ctx, info.IgId, info.ContactId)
-					if err != nil {
-						zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to save FBID for IG user")
-						return
-					}
-				}
-				if len(contactsWithoutIGID) <= batchSize {
-					return
-				}
-				contactsWithoutIGID = contactsWithoutIGID[batchSize:]
-			}
-		}()
-		for _, info := range tbl.LSDeleteThenInsertIGContactInfo {
-			err := m.Main.DB.PutFBIDForIGUser(ctx, info.IgId, info.ContactId)
-			if err != nil {
-				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to save FBID for IG user")
-			}
-		}
 	}
 	for _, evt := range innerQueue {
 		if ctx.Err() != nil {
@@ -719,11 +662,11 @@ func (m *MetaClient) handleAddParticipant(tk handlerParams, evt *table.LSAddPart
 		tk.Sync.Members[evt.ContactId] = m.wrapChatMember(evt)
 		return nil
 	}
+	memberMap := make(bridgev2.ChatMemberMap, 1)
+	memberMap.Add(m.wrapChatMember(evt))
 	return m.wrapChatInfoChange(tk.ID, evt.ContactId, tk.Type, &bridgev2.ChatInfoChange{
 		MemberChanges: &bridgev2.ChatMemberList{
-			Members: []bridgev2.ChatMember{
-				m.wrapChatMember(evt),
-			},
+			MemberMap: memberMap,
 		},
 	}, "LSAddParticipantIdToGroupThread")
 }
@@ -741,13 +684,15 @@ func (m *MetaClient) handleSelfLeaveThread(tk handlerParams, evt *table.LSRemove
 }
 
 func (m *MetaClient) handleRemoveParticipant(tk handlerParams, evt *table.LSRemoveParticipantFromThread) bridgev2.RemoteEvent {
+	memberMap := make(bridgev2.ChatMemberMap, 1)
+	memberMap.Add(bridgev2.ChatMember{
+		EventSender:    m.makeEventSender(evt.ParticipantId),
+		Membership:     event.MembershipLeave,
+		PrevMembership: event.MembershipJoin,
+	})
 	return m.wrapChatInfoChange(tk.ID, evt.ParticipantId, tk.Type, &bridgev2.ChatInfoChange{
 		MemberChanges: &bridgev2.ChatMemberList{
-			Members: []bridgev2.ChatMember{{
-				EventSender:    m.makeEventSender(evt.ParticipantId),
-				Membership:     event.MembershipLeave,
-				PrevMembership: event.MembershipJoin,
-			}},
+			MemberMap: memberMap,
 		},
 	}, "LSRemoveParticipantFromThread")
 }

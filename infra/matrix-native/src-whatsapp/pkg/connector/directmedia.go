@@ -30,6 +30,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exsync"
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waMmsRetry"
@@ -52,7 +53,7 @@ func (wa *WhatsAppConnector) SetUseDirectMedia() {
 }
 
 var ErrReloadNeeded = mautrix.RespError{
-	ErrCode:    "FI.MAU.WHATSAPP_RELOAD_NEEDED",
+	ErrCode:    "COM.BEEPER.MEDIA_RELOAD_NEEDED",
 	Err:        "Media is no longer available on WhatsApp servers and must be re-requested from your phone",
 	StatusCode: http.StatusNotFound,
 }
@@ -84,13 +85,15 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 	if waClient.Client == nil {
 		return nil, fmt.Errorf("no WhatsApp client found on login %s", parsedID.UserLogin)
 	}
+	waClient.avatarLock.Lock(parsedID.Avatar.TargetJID)
+	defer waClient.avatarLock.Unlock(parsedID.Avatar.TargetJID)
 	cachedInfo, err := wa.DB.AvatarCache.Get(ctx, parsedID.Avatar.TargetJID, parsedID.Avatar.AvatarID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get avatar cache entry: %w", err)
 	}
-	if cachedInfo != nil && cachedInfo.Gone {
+	if cachedInfo.IsGone() {
 		return nil, mautrix.MNotFound.WithMessage("Avatar is no longer available (cached response)")
-	} else if cachedInfo == nil || cachedInfo.Expiry.Time.Before(time.Now().Add(5*time.Minute)) {
+	} else if cachedInfo.Expired() {
 		zerolog.Ctx(ctx).Debug().
 			Str("avatar_id", parsedID.Avatar.AvatarID).
 			Msg("Refreshing avatar URL from WhatsApp servers")
@@ -99,7 +102,7 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 		})
 		if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) ||
 			errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) ||
-			(err == nil && (avatar == nil || avatar.ID != parsedID.Avatar.AvatarID)) {
+			(err == nil && (avatar == nil || (avatar.ID != parsedID.Avatar.AvatarID && !parsedID.Avatar.IsRandom()))) {
 			zerolog.Ctx(ctx).Debug().
 				Err(err).
 				Stringer("target_jid", parsedID.Avatar.TargetJID).
@@ -107,9 +110,14 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 				Str("wanted_avatar_id", parsedID.Avatar.AvatarID).
 				Str("got_avatar_id", ptr.Val(avatar).ID).
 				Msg("Avatar is no longer available")
+			var goneExpiry jsontime.Unix
+			if parsedID.Avatar.IsRandom() {
+				goneExpiry = jsontime.U(time.Now().Add(7 * 24 * time.Hour))
+			}
 			err = wa.DB.AvatarCache.Put(ctx, &wadb.AvatarCacheEntry{
 				EntityJID: parsedID.Avatar.TargetJID,
 				AvatarID:  parsedID.Avatar.AvatarID,
+				Expiry:    goneExpiry,
 				Gone:      true,
 			})
 			if err != nil {
@@ -127,6 +135,15 @@ func (wa *WhatsAppConnector) downloadAvatarDirectMedia(ctx context.Context, pars
 			zerolog.Ctx(ctx).Warn().Err(err).
 				Str("avatar_id", avatar.ID).
 				Msg("Failed to update avatar cache entry")
+		}
+		if cachedInfo.AvatarID != parsedID.Avatar.AvatarID {
+			cachedInfo.AvatarID = parsedID.Avatar.AvatarID
+			err = wa.DB.AvatarCache.Put(ctx, cachedInfo)
+			if err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).
+					Str("avatar_id", parsedID.Avatar.AvatarID).
+					Msg("Failed to update avatar cache entry")
+			}
 		}
 	}
 	return &mediaproxy.GetMediaResponseFile{
@@ -212,7 +229,7 @@ func (wa *WhatsAppConnector) makeDirectMediaResponse(
 			log := zerolog.Ctx(ctx)
 			err := waClient.Client.DownloadToFile(ctx, dm, f)
 			if keys != nil && (errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) || errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) || errors.Is(err, whatsmeow.ErrNoURLPresent)) {
-				val := params["fi.mau.whatsapp.reload_media"]
+				val := params["com.beeper.interactive_download_request"]
 				if val == "false" || (!wa.Config.DirectMediaAutoRequest && val != "true") {
 					return nil, ErrReloadNeeded
 				}
@@ -255,10 +272,11 @@ func (wa *WhatsAppConnector) makeDirectMediaResponse(
 
 type directMediaRetry struct {
 	sync.Mutex
-	resultURL  string
-	wait       *exsync.Event
-	requested  bool
-	resultType waMmsRetry.MediaRetryNotification_ResultType
+	resultURL   string
+	wait        *exsync.Event
+	requested   bool
+	resultType  waMmsRetry.MediaRetryNotification_ResultType
+	decryptFail bool
 }
 
 func (wa *WhatsAppClient) getDirectMediaRetryState(msgID networkid.MessageID, create bool) *directMediaRetry {
@@ -284,6 +302,9 @@ func (wa *WhatsAppClient) requestAndWaitDirectMedia(ctx context.Context, rawMsgI
 		if state.resultURL != "" {
 			keys.DirectPath = state.resultURL
 			return nil
+		}
+		if state.decryptFail {
+			return mautrix.MNotFound.WithMessage("Unable to retrieve media: failed to decrypt the media retry notification from your phone.")
 		}
 		switch state.resultType {
 		case waMmsRetry.MediaRetryNotification_NOT_FOUND:
@@ -338,6 +359,9 @@ func (wa *WhatsAppClient) receiveDirectMediaRetry(ctx context.Context, msg *data
 	retryData, err := whatsmeow.DecryptMediaRetryNotification(retry, keys.Key)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to decrypt media retry notification")
+		if state != nil {
+			state.decryptFail = true
+		}
 		return
 	}
 	if state != nil {

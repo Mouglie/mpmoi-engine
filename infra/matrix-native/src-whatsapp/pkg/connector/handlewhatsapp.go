@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exslices"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -113,8 +115,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	case *events.HistorySync:
 		wa.UserLogin.Log.Warn().Msg("Unexpected history sync event received")
 	case *events.MediaRetry:
-		wa.phoneSeen(evt.Timestamp)
-		success = wa.UserLogin.QueueRemoteEvent(&WAMediaRetry{MediaRetry: evt, wa: wa}).Success
+		success = wa.handleWAMediaRetry(ctx, evt)
 
 	case *events.GroupInfo:
 		success = wa.handleWAGroupInfoChange(ctx, evt)
@@ -158,7 +159,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		if err != nil {
 			log.Err(err).Msg("Failed to update push name in store")
 		}
-		_, _, err = wa.GetStore().Contacts.PutPushName(ctx, wa.GetStore().GetLID().ToNonAD(), evt.Action.GetName())
+		_, _, err = wa.GetStore().Contacts.PutPushName(ctx, wa.GetLID().ToNonAD(), evt.Action.GetName())
 		if err != nil {
 			log.Err(err).Msg("Failed to update push name in store")
 		}
@@ -203,7 +204,7 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 		wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 		wa.notifyOfflineSyncWaiter(nil)
 	case *events.LoggedOut:
-		wa.handleWALogout(evt.Reason, evt.OnConnect)
+		wa.handleWALogout(ctx, evt.Reason, evt.OnConnect)
 		wa.notifyOfflineSyncWaiter(fmt.Errorf("logged out: %s", evt.Reason))
 	case *events.Disconnected:
 		// Don't send the normal transient disconnect state if we're already in a different transient disconnect state.
@@ -259,71 +260,37 @@ func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	return
 }
 
-func (wa *WhatsAppClient) rerouteWAMessage(ctx context.Context, evtType string, info *types.MessageSource, msgID any) {
-	if (info.Chat.Server == types.HiddenUserServer || info.Chat.Server == types.BroadcastServer) &&
-		info.Sender.Server == types.HiddenUserServer && info.SenderAlt.IsEmpty() {
-		info.SenderAlt, _ = wa.GetStore().LIDs.GetPNForLID(ctx, info.Sender)
-	}
-	if info.Chat.Server == types.HiddenUserServer && info.IsFromMe && info.RecipientAlt.IsEmpty() {
-		info.RecipientAlt, _ = wa.GetStore().LIDs.GetPNForLID(ctx, info.Chat)
-	}
-	if info.Chat.Server == types.HiddenUserServer && info.Sender.ToNonAD() == info.Chat && info.SenderAlt.Server == types.DefaultUserServer {
-		wa.UserLogin.Log.Debug().
-			Stringer("lid", info.Sender).
-			Stringer("pn", info.SenderAlt).
-			Any("message_id", msgID).
-			Str("evt_type", evtType).
-			Msg("Forced LID DM sender to phone number in incoming message")
-		info.Sender, info.SenderAlt = info.SenderAlt, info.Sender
-		info.Chat = info.Sender.ToNonAD()
-	} else if info.Chat.Server == types.HiddenUserServer && info.IsFromMe && info.RecipientAlt.Server == types.DefaultUserServer {
-		wa.UserLogin.Log.Debug().
-			Stringer("lid", info.Chat).
-			Stringer("pn", info.RecipientAlt).
-			Any("message_id", msgID).
-			Str("evt_type", evtType).
-			Msg("Forced LID DM sender to phone number in own message sent from another device")
-		info.Chat = info.RecipientAlt.ToNonAD()
-		if info.Sender.Server == types.HiddenUserServer {
-			info.Sender, info.SenderAlt = info.SenderAlt, info.Sender
-			if info.Sender.IsEmpty() {
-				info.Sender = wa.GetStore().GetJID()
-				info.Sender.Device = info.SenderAlt.Device
-			}
-		}
-	} else if info.Chat.Server == types.BroadcastServer && info.Sender.Server == types.HiddenUserServer && info.SenderAlt.Server == types.DefaultUserServer {
-		wa.UserLogin.Log.Debug().
-			Stringer("lid", info.Sender).
-			Stringer("pn", info.SenderAlt).
-			Stringer("chat", info.Chat).
-			Any("message_id", msgID).
-			Str("evt_type", evtType).
-			Msg("Forced LID broadcast list sender to phone number in incoming message")
-		info.Sender, info.SenderAlt = info.SenderAlt, info.Sender
-	} else if info.Sender.Server == types.BotServer && info.Chat.Server == types.HiddenUserServer {
-		chatPN, err := wa.GetStore().LIDs.GetPNForLID(ctx, info.Chat)
+func (wa *WhatsAppClient) ensureAltJIDs(ctx context.Context, info *types.MessageSource, checkPhones bool) bool {
+	var err error
+	if info.Sender.Server == types.DefaultUserServer && info.SenderAlt.IsEmpty() {
+		info.SenderAlt, err = wa.GetStore().LIDs.GetLIDForPN(ctx, info.Sender)
 		if err != nil {
-			wa.UserLogin.Log.Err(err).
-				Any("message_id", msgID).
-				Stringer("lid", info.Chat).
-				Str("evt_type", evtType).
-				Msg("Failed to get phone number of DM for incoming bot message")
-		} else if !chatPN.IsEmpty() {
-			wa.UserLogin.Log.Debug().
-				Stringer("lid", info.Chat).
-				Stringer("pn", chatPN).
-				Any("message_id", msgID).
-				Str("evt_type", evtType).
-				Msg("Forced LID chat to phone number in bot message")
-			info.Chat = chatPN
+			zerolog.Ctx(ctx).Err(err).Stringer("sender", info.Sender).Msg("Failed to get LID for sender")
+			return false
 		}
 	}
+	if info.Chat.Server == types.DefaultUserServer && info.IsFromMe && info.RecipientAlt.IsEmpty() {
+		info.RecipientAlt, err = wa.GetStore().LIDs.GetLIDForPN(ctx, info.Chat)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Stringer("chat", info.Chat).Msg("Failed to get LID for chat")
+			return false
+		}
+	}
+	if checkPhones {
+		return wa.checkAllPhonesInMessage(ctx, info)
+	}
+	return true
 }
 
 func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Message) (success bool) {
 	success = true
-	if evt.Info.Chat == types.StatusBroadcastJID && !wa.Main.Config.EnableStatusBroadcast {
+	if (evt.Info.Chat == types.StatusBroadcastJID && !wa.Main.Config.EnableStatusBroadcast) ||
+		(evt.Info.Chat.Server == types.NewsletterServer && wa.disableNewsletter) ||
+		(evt.Info.Chat.Server == types.BroadcastServer && evt.Info.IsFromMe) {
 		return
+	}
+	if !wa.ensureAltJIDs(ctx, &evt.Info.MessageSource, true) {
+		return false
 	}
 	parsedMessageType := getMessageType(evt.Message)
 	if encReact := evt.Message.GetEncReactionMessage(); encReact != nil {
@@ -358,8 +325,6 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		evt.UnwrapRaw()
 		parsedMessageType = getMessageType(evt.Message)
 	}
-	origSource := evt.Info.MessageSource
-	wa.rerouteWAMessage(ctx, "message", &evt.Info.MessageSource, evt.Info.ID)
 	wa.UserLogin.Log.Trace().
 		Any("info", evt.Info).
 		Any("payload", evt.Message).
@@ -369,7 +334,15 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		wa.Main.Bridge.Config.Backfill.Enabled {
 		wa.saveWAHistorySyncNotification(ctx, evt.Message.ProtocolMessage.HistorySyncNotification)
 	}
-	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
+	if parsedMessageType == "ignore" {
+		return
+	} else if strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
+		wa.UserLogin.Log.Debug().
+			Str("message_id", evt.Info.ID).
+			Stringer("chat_jid", evt.Info.Chat).
+			Stringer("sender_jid", evt.Info.Sender).
+			Stringer("protocol_message_type", evt.Message.GetProtocolMessage().GetType()).
+			Msg("Ignoring unknown protocol message")
 		return
 	}
 
@@ -377,18 +350,8 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	messageAssoc := evt.Message.GetMessageContextInfo().GetMessageAssociation()
 	if assocType := messageAssoc.GetAssociationType(); assocType == waE2E.MessageAssociation_HD_IMAGE_DUAL_UPLOAD || assocType == waE2E.MessageAssociation_HD_VIDEO_DUAL_UPLOAD {
 		parentKey := messageAssoc.GetParentMessageKey()
-		protocolMsg := evt.Message.GetProtocolMessage()
-		if protocolMsg.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetKey() == nil {
-			protocolMsg = &waE2E.ProtocolMessage{
-				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
-				Key:           parentKey,
-				EditedMessage: evt.Message.GetAssociatedChildMessage().GetMessage(),
-			}
-			dontRenderEdited = true
-		} else if child := protocolMsg.GetEditedMessage().GetAssociatedChildMessage().GetMessage(); child != nil {
-			protocolMsg.EditedMessage = child
-			protocolMsg.Key = parentKey
-		}
+		protocolMsg, shouldHideEdit := makeHDMediaReplacementEdit(evt.Message, parentKey)
+		dontRenderEdited = shouldHideEdit
 		wa.UserLogin.Log.Debug().
 			Str("message_id", evt.Info.ID).
 			Str("parent_id", parentKey.GetID()).
@@ -410,9 +373,8 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 
 	res := wa.UserLogin.QueueRemoteEvent(&WAMessageEvent{
 		MessageInfoWrapper: &MessageInfoWrapper{
-			OrigSource: origSource,
-			Info:       evt.Info,
-			wa:         wa,
+			Info: evt.Info,
+			wa:   wa,
 		},
 		Message:  evt.Message,
 		MsgEvent: evt,
@@ -423,8 +385,30 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	return res.Success
 }
 
+func makeHDMediaReplacementEdit(message *waE2E.Message, parentKey *waCommon.MessageKey) (*waE2E.ProtocolMessage, bool) {
+	protocolMsg := message.GetProtocolMessage()
+	associatedMessage := message.GetAssociatedChildMessage().GetMessage()
+	if protocolMsg.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT || protocolMsg.GetKey() == nil {
+		protocolMsg = associatedMessage.GetProtocolMessage()
+	}
+	if protocolMsg.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && protocolMsg.GetKey() != nil {
+		if child := protocolMsg.GetEditedMessage().GetAssociatedChildMessage().GetMessage(); child != nil {
+			protocolMsg.EditedMessage = child
+		}
+		protocolMsg.Key = parentKey
+		return protocolMsg, false
+	}
+	return &waE2E.ProtocolMessage{
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:           parentKey,
+		EditedMessage: associatedMessage,
+	}, true
+}
+
 func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt *events.UndecryptableMessage) bool {
-	wa.rerouteWAMessage(ctx, "undecryptable message", &evt.Info.MessageSource, evt.Info.ID)
+	if !wa.ensureAltJIDs(ctx, &evt.Info.MessageSource, true) {
+		return false
+	}
 	wa.UserLogin.Log.Debug().
 		Any("info", evt.Info).
 		Bool("unavailable", evt.IsUnavailable).
@@ -447,11 +431,43 @@ func (wa *WhatsAppClient) handleWAUndecryptableMessage(ctx context.Context, evt 
 	return res.Success
 }
 
+func (wa *WhatsAppClient) handleWAMediaRetry(ctx context.Context, evt *events.MediaRetry) bool {
+	wa.phoneSeen(evt.Timestamp)
+	var senderLID, chatLID types.JID
+	var err error
+	if evt.SenderID.Server == types.DefaultUserServer {
+		senderLID, err = wa.GetStore().LIDs.GetLIDForPN(ctx, evt.SenderID)
+		if err != nil {
+			wa.UserLogin.Log.Err(err).
+				Stringer("sender_id", evt.SenderID).
+				Msg("Failed to get LID for media retry sender")
+			return false
+		}
+	}
+	if evt.ChatID.Server == types.DefaultUserServer {
+		chatLID, err = wa.GetStore().LIDs.GetLIDForPN(ctx, evt.ChatID)
+		if err != nil {
+			wa.UserLogin.Log.Err(err).
+				Stringer("chat_id", evt.ChatID).
+				Msg("Failed to get LID for media retry chat")
+			return false
+		}
+	}
+	res := wa.UserLogin.QueueRemoteEvent(&WAMediaRetry{
+		MediaRetry: evt,
+		wa:         wa,
+		senderLID:  senderLID,
+		chatLID:    chatLID,
+	})
+	return res.Success
+}
+
 func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Receipt) (success bool) {
-	origChat := evt.Chat
-	wa.rerouteWAMessage(ctx, "receipt", &evt.MessageSource, evt.MessageIDs)
 	if evt.IsFromMe && evt.Sender.Device == 0 {
 		wa.phoneSeen(evt.Timestamp)
+	}
+	if !wa.ensureAltJIDs(ctx, &evt.MessageSource, true) {
+		return false
 	}
 	var evtType bridgev2.RemoteEventType
 	switch evt.Type {
@@ -464,29 +480,44 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	default:
 		return true
 	}
-	targets := make([]networkid.MessageID, len(evt.MessageIDs))
-	messageSender := wa.JID
+	targets := make([]networkid.MessageID, 0, len(evt.MessageIDs))
+	messageSender := wa.GetLID()
 	if !evt.MessageSender.IsEmpty() {
 		messageSender = evt.MessageSender
-		// Second part of rerouting receipts in LID chats
-		if messageSender == origChat && evt.Chat != origChat {
-			messageSender = evt.Chat
-		}
-	} else if evt.Chat.Server == types.GroupServer && evt.Sender.Server == types.HiddenUserServer {
-		lid := wa.GetStore().GetLID()
-		if !lid.IsEmpty() {
-			messageSender = lid
+	} else if evt.Chat.Server == types.NewsletterServer {
+		messageSender = evt.Chat
+	}
+	var chatAlt types.JID
+	if evt.Chat.Server == types.DefaultUserServer {
+		chatLID, _ := wa.GetStore().LIDs.GetLIDForPN(ctx, evt.Chat)
+		if !chatLID.IsEmpty() {
+			chatAlt = evt.Chat
+			evt.Chat = chatLID
 		}
 	}
-	for i, id := range evt.MessageIDs {
-		targets[i] = waid.MakeMessageID(evt.Chat, messageSender, id)
+	for _, id := range evt.MessageIDs {
+		targets = append(targets, waid.MakeMessageID(evt.Chat, messageSender, id))
+		if !chatAlt.IsEmpty() {
+			targets = append(targets, waid.MakeMessageID(chatAlt, messageSender, id))
+		}
+	}
+	senderLID := evt.Sender
+	if senderLID.Server == types.DefaultUserServer && !evt.SenderAlt.IsEmpty() {
+		senderLID = evt.SenderAlt
+	} else if evt.Chat.Server == types.NewsletterServer && evt.Type == types.ReceiptTypeReadSelf {
+		senderLID = wa.GetLID()
 	}
 	res := wa.UserLogin.QueueRemoteEvent(&simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      evtType,
 			PortalKey: wa.makeWAPortalKey(evt.Chat),
-			Sender:    wa.makeEventSender(ctx, evt.Sender),
+			Sender:    wa.makeEventSender(ctx, senderLID),
 			Timestamp: evt.Timestamp,
+			LogContext: func(c zerolog.Context) zerolog.Context {
+				return c.
+					Strs("targets", exslices.CastToString[string](targets)).
+					Stringer("receipt_sender", senderLID)
+			},
 		},
 		Targets: targets,
 	})
@@ -494,11 +525,11 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 }
 
 func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.ChatPresence) {
-	if evt.Chat.Server == types.HiddenUserServer && evt.Sender.ToNonAD() == evt.Chat {
+	if evt.Chat.Server == types.DefaultUserServer && evt.Sender.ToNonAD() == evt.Chat {
 		if evt.SenderAlt.IsEmpty() {
-			evt.SenderAlt, _ = wa.GetStore().LIDs.GetPNForLID(ctx, evt.Sender)
+			evt.SenderAlt, _ = wa.GetStore().LIDs.GetLIDForPN(ctx, evt.Sender)
 		}
-		if evt.SenderAlt.Server == types.DefaultUserServer {
+		if evt.SenderAlt.Server == types.HiddenUserServer {
 			evt.Sender, evt.SenderAlt = evt.SenderAlt, evt.Sender
 			evt.Chat = evt.Sender.ToNonAD()
 		}
@@ -525,7 +556,7 @@ func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.
 	})
 }
 
-func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onConnect bool) {
+func (wa *WhatsAppClient) handleWALogout(ctx context.Context, reason events.ConnectFailureReason, onConnect bool) {
 	errorCode := WAUnknownLogout
 	if reason == events.ConnectFailureLoggedOut {
 		errorCode = WALoggedOut
@@ -535,7 +566,12 @@ func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onC
 	wa.Disconnect()
 	wa.Client = nil
 	wa.JID = types.EmptyJID
+	wa.LID = types.EmptyJID
 	wa.UserLogin.Metadata.(*waid.UserLoginMetadata).WADeviceID = 0
+	err := wa.Main.DB.Conversation.DeleteAll(ctx, wa.UserLogin.ID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to delete history sync data on logout")
+	}
 	wa.UserLogin.BridgeState.Send(status.BridgeState{
 		StateEvent: status.StateBadCredentials,
 		Error:      errorCode,
@@ -548,12 +584,15 @@ func (wa *WhatsAppClient) handleWACallStart(ctx context.Context, group, sender, 
 	if !wa.Main.Config.CallStartNotices || time.Since(ts) > callEventMaxAge {
 		return true
 	}
-	if sender.Server == types.HiddenUserServer && senderAlt.Server == types.DefaultUserServer {
+	if sender.Server == types.DefaultUserServer && senderAlt.IsEmpty() {
+		senderAlt, _ = wa.GetStore().LIDs.GetLIDForPN(ctx, sender)
+	}
+	if sender.Server == types.DefaultUserServer && senderAlt.Server == types.HiddenUserServer {
 		wa.UserLogin.Log.Debug().
-			Stringer("lid", sender).
-			Stringer("pn", senderAlt).
+			Stringer("lid", senderAlt).
+			Stringer("pn", sender).
 			Str("call_id", id).
-			Msg("Forced LID caller to phone number in incoming call")
+			Msg("Forced phone number caller to LID in incoming call")
 		sender, senderAlt = senderAlt, sender
 	}
 	chat := group
@@ -599,6 +638,12 @@ func convertCallStart(ctx context.Context, portal *bridgev2.Portal, intent bridg
 func (wa *WhatsAppClient) handleWAIdentityChange(ctx context.Context, evt *events.IdentityChange) {
 	if !wa.Main.Config.IdentityChangeNotices {
 		return
+	}
+	if evt.JID.Server == types.DefaultUserServer {
+		lid, _ := wa.GetStore().LIDs.GetLIDForPN(ctx, evt.JID)
+		if !lid.IsEmpty() {
+			evt.JID = lid
+		}
 	}
 	wa.UserLogin.QueueRemoteEvent(&simplevent.Message[*events.IdentityChange]{
 		EventMeta: simplevent.EventMeta{
@@ -650,13 +695,14 @@ func (wa *WhatsAppClient) handleWADeleteChat(ctx context.Context, evt *events.De
 
 func (wa *WhatsAppClient) handleWADeleteForMe(ctx context.Context, evt *events.DeleteForMe) bool {
 	chatJID := wa.maybeConvertJIDToLID(ctx, evt.ChatJID)
+	senderJID := wa.maybeConvertJIDToLID(ctx, evt.SenderJID)
 	return wa.UserLogin.QueueRemoteEvent(&simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessageRemove,
 			PortalKey: wa.makeWAPortalKey(chatJID),
 			Timestamp: evt.Timestamp,
 		},
-		TargetMessage: waid.MakeMessageID(chatJID, evt.SenderJID, evt.MessageID),
+		TargetMessage: waid.MakeMessageID(chatJID, senderJID, evt.MessageID),
 		OnlyForMe:     true,
 	}).Success
 }
@@ -667,7 +713,7 @@ func (wa *WhatsAppClient) handleWAMarkChatAsRead(ctx context.Context, evt *event
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
 			PortalKey: wa.makeWAPortalKey(chatJID),
-			Sender:    wa.makeEventSender(ctx, wa.JID),
+			Sender:    wa.makeEventSender(ctx, wa.GetLID()),
 			Timestamp: evt.Timestamp,
 		},
 		ReadUpTo: evt.Timestamp,
@@ -690,13 +736,13 @@ func (wa *WhatsAppClient) syncGhost(jid types.JID, reason string, pictureID *str
 	if pictureID != nil && *pictureID != "" && ghost.AvatarID == networkid.AvatarID(*pictureID) {
 		return
 	}
-	userInfo, err := wa.getUserInfo(ctx, jid, pictureID != nil)
+	userInfo, err := wa.getUserInfo(ctx, jid, ptr.Val(pictureID), pictureID != nil)
 	if err != nil {
 		log.Err(err).Msg("Failed to get user info")
 	} else {
 		ghost.UpdateInfo(ctx, userInfo)
 		log.Debug().Msg("Synced ghost info")
-		wa.syncAltGhostWithInfo(ctx, jid, userInfo)
+		wa.syncAltGhostWithInfo(ctx, jid, ghost)
 	}
 	go wa.syncRemoteProfile(ctx, ghost)
 }
@@ -756,9 +802,6 @@ func (wa *WhatsAppClient) handleWAGroupInfoChange(ctx context.Context, evt *even
 }
 
 func (wa *WhatsAppClient) handleWAJoinedGroup(ctx context.Context, evt *events.JoinedGroup) bool {
-	if wa.createDedup.Pop(evt.CreateKey) {
-		return true
-	}
 	return wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -771,6 +814,9 @@ func (wa *WhatsAppClient) handleWAJoinedGroup(ctx context.Context, evt *events.J
 }
 
 func (wa *WhatsAppClient) handleWANewsletterJoin(ctx context.Context, evt *events.NewsletterJoin) bool {
+	if wa.disableNewsletter {
+		return true
+	}
 	return wa.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventChatResync,
@@ -869,7 +915,12 @@ func (wa *WhatsAppClient) handleWAAppStateSyncComplete(ctx context.Context, evt 
 		} else {
 			log.Info().
 				Time("recovery_ts", ts).
+				Bool("recovery_evt", evt.Recovery).
 				Msg("Unmarked app state recovery as attempted after successful full sync")
+			wa.UserLogin.TrackAnalytics("WhatsApp Appstate Recovery Success", map[string]any{
+				"patch_name":    evt.Name,
+				"from_recovery": evt.Recovery,
+			})
 		}
 	} else if ts, exists = wa.appStateFullSyncAttempted[evt.Name]; exists {
 		delete(wa.appStateFullSyncAttempted, evt.Name)
@@ -926,6 +977,9 @@ func (wa *WhatsAppClient) handleWAAppStateSyncError(ctx context.Context, evt *ev
 	if err != nil {
 		log.Err(err).Msg("Failed to save login metadata after marking app state recovery as attempted")
 	}
+	wa.UserLogin.TrackAnalytics("WhatsApp Appstate Recovery Request", map[string]any{
+		"patch_name": evt.Name,
+	})
 	go func() {
 		resp, err := wa.Client.SendPeerMessage(ctx, whatsmeow.BuildAppStateRecoveryRequest(evt.Name))
 		if err != nil {

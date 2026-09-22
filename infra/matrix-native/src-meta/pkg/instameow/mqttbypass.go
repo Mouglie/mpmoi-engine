@@ -39,7 +39,9 @@ type indicateActivity struct {
 }
 
 func (c *Client) SetTyping(ctx context.Context, threadID string, typing bool) error {
-	if !c.enableTyping {
+	if c == nil {
+		return ErrClientIsNil
+	} else if !c.enableTyping {
 		return nil
 	}
 	req := &indicateActivity{
@@ -93,7 +95,7 @@ func (c *Client) getMQTTBypassSocketOptions() dgw.SocketOptions {
 		AppID:      c.configs.BrowserConfigTable.DGWWebConfig.AppID,
 		UserID:     c.configs.BrowserConfigTable.PolarisViewer.ID,
 		DeviceID:   c.configs.BrowserConfigTable.IGDMqttWebDeviceID.ClientID,
-		OnConnect: func(ctx context.Context) error {
+		OnConnect: func(ctx context.Context, _ func(error)) error {
 			payload, err := thrift.Marshal(&mqttbypass.RequestPayload{
 				ConnectRequest: &mqttbypass.ConnectRequest{
 					DeviceId:     c.configs.BrowserConfigTable.IGDMqttWebDeviceID.ClientID,

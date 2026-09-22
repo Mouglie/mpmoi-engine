@@ -59,6 +59,7 @@ type IGClient struct {
 	mailboxProcessed      atomic.Bool
 	waitMailboxProcessed  chan struct{}
 	permanentErrored      atomic.Bool
+	stopPeriodicReconnect atomic.Pointer[context.CancelFunc]
 }
 
 func (ic *IGConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
@@ -126,6 +127,8 @@ func (ic *IGClient) ensureIGClient() {
 			Settings:      ic.Main.Bridge.GetHTTPClientSettings(),
 			EventHandler:  ic.handleIGEvent,
 			DisableTyping: ic.Main.Config.DisableTyping,
+
+			LogRedactedBloksPayloads: ic.Main.Config.LogRedactedBloksPayloads,
 		})
 	}
 }
@@ -188,23 +191,27 @@ func (ic *IGClient) errorToBridgeState(ctx context.Context, err error) (state *s
 			StateEvent: status.StateBadCredentials,
 			Error:      IGChallengeRequired,
 			UserAction: status.UserActionRestart,
+			Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 		}
 	} else if errors.Is(err, httpclient.ErrAccountSuspended) {
 		state = &status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      IGAccountSuspended,
+			Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 		}
 	} else if errors.Is(err, httpclient.ErrCheckpointRequired) {
 		state = &status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      FBCheckpointRequired,
 			UserAction: status.UserActionRestart,
+			Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 		}
 	} else if errors.Is(err, httpclient.ErrConsentRequired) {
 		state = &status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      IGConsentRequired,
 			UserAction: status.UserActionRestart,
+			Info:       map[string]any{"open_url": httpclient.GetErrorRedirectURL(err)},
 		}
 	}
 	if state != nil {
@@ -257,6 +264,7 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 			Time("last_used", lastUsed).
 			Msg("Failed to load reconnection state")
 	} else if cli.HasSeqID() {
+		ic.schedulePeriodicReconnect(ctx)
 		zerolog.Ctx(ctx).Debug().
 			Time("last_used", lastUsed).
 			Msg("Reconnecting with cached state")
@@ -268,7 +276,7 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 	var err error
 	if cli.HasSeqID() {
 		zerolog.Ctx(ctx).Debug().Msg("Seq ID already stored, only reloading index")
-		err = cli.ReloadIndex(ctx)
+		_, err = cli.ReloadIndex(ctx)
 	} else {
 		currentUser, mailbox, err = cli.LoadIndex(ctx)
 	}
@@ -277,6 +285,14 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 		if state := ic.errorToBridgeState(ctx, err); state != nil {
 			ic.UserLogin.BridgeState.Send(*state)
 		} else if lsErr := (&types.ErrorResponse{}); errors.As(err, &lsErr) {
+			if errors.Is(err, types.ErrPleaseReloadPage) {
+				err = ic.Main.DB.DeleteReconnectionState(ctx, ic.UserLogin.ID)
+				if err != nil {
+					zerolog.Ctx(ctx).Err(err).Msg("Failed to delete reconnection state after please reload page error")
+				} else {
+					zerolog.Ctx(ctx).Debug().Msg("Deleted reconnection state after please reload page error")
+				}
+			}
 			stateEvt := status.StateUnknownError
 			if lsErr.ErrorCode == 1357053 {
 				stateEvt = status.StateBadCredentials
@@ -321,6 +337,7 @@ func (ic *IGClient) connectWithRetry(retryCtx, ctx context.Context, attempts int
 		zerolog.Ctx(ctx).Err(ctx.Err()).Msg("Connection cancelled")
 		return
 	}
+	ic.schedulePeriodicReconnect(ctx)
 	zerolog.Ctx(ctx).Debug().Msg("Processed index, connecting to DGW")
 	go ic.Client.Connect(ctx)
 }
@@ -356,6 +373,7 @@ func (ic *IGClient) connectWithMailbox(ctx, retryCtx context.Context, currentUse
 }
 
 func (ic *IGClient) Disconnect() {
+	ic.cancelPeriodicReconnect()
 	ic.permanentErrored.Store(false)
 	if stopConnectAttempt := ic.stopConnectAttempt.Swap(nil); stopConnectAttempt != nil {
 		(*stopConnectAttempt)()
@@ -383,7 +401,34 @@ func (ic *IGClient) LogoutRemote(ctx context.Context) {
 	ic.LoginMeta.Cookies = nil
 }
 
-func (ic *IGClient) FullReconnect(seqIDOnly bool) {
+func (ic *IGClient) cancelPeriodicReconnect() {
+	if oldCancel := ic.stopPeriodicReconnect.Swap(nil); oldCancel != nil {
+		(*oldCancel)()
+	}
+}
+
+func (ic *IGClient) schedulePeriodicReconnect(ctx context.Context) {
+	if ic.Main.Config.ForceRefreshIntervalSeconds <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	if oldCancel := ic.stopPeriodicReconnect.Swap(&cancel); oldCancel != nil {
+		(*oldCancel)()
+	}
+	interval := time.Duration(ic.Main.Config.ForceRefreshIntervalSeconds) * time.Second
+	ic.UserLogin.Log.Info().Stringer("interval", interval).Msg("Periodic reconnect scheduled")
+	go func() {
+		defer cancel()
+		select {
+		case <-time.After(interval):
+			ic.UserLogin.Log.Info().Msg("Doing periodic reconnect")
+			ic.FullReconnect(false, true)
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (ic *IGClient) FullReconnect(seqIDOnly, reconnectionStateOnly bool) {
 	if ic.LoginMeta.Cookies == nil {
 		return
 	}
@@ -392,6 +437,8 @@ func (ic *IGClient) FullReconnect(seqIDOnly bool) {
 	var err error
 	if seqIDOnly {
 		err = ic.Main.DB.DeleteIGSeqID(ctx, ic.UserLogin.ID)
+	} else if reconnectionStateOnly {
+		err = ic.Main.DB.DeleteReconnectionStateOnly(ctx, ic.UserLogin.ID)
 	} else {
 		err = ic.Main.DB.DeleteReconnectionState(ctx, ic.UserLogin.ID)
 	}

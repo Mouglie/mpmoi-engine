@@ -29,6 +29,8 @@ func (wa *WhatsAppClient) GetChatInfo(ctx context.Context, portal *bridgev2.Port
 	return wa.getChatInfo(ctx, portalJID, nil, portal.MXID == "")
 }
 
+var ErrBroadcastList = errors.New("broadcast list bridging is currently not supported")
+
 func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, conv *wadb.Conversation, isNew bool) (wrapped *bridgev2.ChatInfo, err error) {
 	switch portalJID.Server {
 	case types.DefaultUserServer, types.HiddenUserServer, types.BotServer:
@@ -37,7 +39,7 @@ func (wa *WhatsAppClient) getChatInfo(ctx context.Context, portalJID types.JID, 
 		if portalJID == types.StatusBroadcastJID {
 			wrapped = wa.wrapStatusBroadcastInfo(ctx)
 		} else {
-			return nil, fmt.Errorf("broadcast list bridging is currently not supported")
+			return nil, ErrBroadcastList
 		}
 	case types.GroupServer:
 		info, err := wa.Client.GetGroupInfo(ctx, portalJID)
@@ -99,6 +101,18 @@ func (wa *WhatsAppClient) applyChatSettings(ctx context.Context, chatID types.JI
 		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get chat settings")
 		return
 	}
+	if !chat.Found {
+		chatID, err = wa.GetStore().GetAltJID(ctx, chatID)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get alternate JID to get chat settings")
+			return
+		}
+		chat, err = wa.GetStore().ChatSettings.GetChatSettings(ctx, chatID)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get chat settings with alternate JID")
+			return
+		}
+	}
 	info.UserLocal = &bridgev2.UserLocalPortalInfo{
 		MutedUntil: ptr.Ptr(chat.MutedUntil),
 	}
@@ -141,15 +155,20 @@ const PrivateChatTopic = "WhatsApp private chat"
 const BotChatTopic = "WhatsApp chat with a bot"
 
 func (wa *WhatsAppClient) wrapDMInfo(ctx context.Context, jid types.JID) *bridgev2.ChatInfo {
+	ownID := wa.JID
+	if jid.Server == types.HiddenUserServer {
+		ownID = wa.GetLID()
+	}
 	info := &bridgev2.ChatInfo{
+		Type:  ptr.Ptr(database.RoomTypeDM),
 		Topic: ptr.Ptr(PrivateChatTopic),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:           true,
 			TotalMemberCount: 2,
 			OtherUserID:      waid.MakeUserID(jid),
 			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
-				waid.MakeUserID(jid):    {EventSender: wa.makeEventSender(ctx, jid)},
-				waid.MakeUserID(wa.JID): {EventSender: wa.makeEventSender(ctx, wa.JID)},
+				waid.MakeUserID(jid):   {EventSender: wa.makeEventSender(ctx, jid)},
+				waid.MakeUserID(ownID): {EventSender: wa.makeEventSender(ctx, ownID)},
 			},
 			PowerLevels: &bridgev2.PowerLevelOverrides{
 				Events: map[event.Type]int{
@@ -159,13 +178,14 @@ func (wa *WhatsAppClient) wrapDMInfo(ctx context.Context, jid types.JID) *bridge
 					event.StateBeeperDisappearingTimer: 0,
 				},
 			},
+			ExcludeChangesFromTimeline: true,
 		},
-		Type: ptr.Ptr(database.RoomTypeDM),
+		ExcludeChangesFromTimeline: true,
 	}
 	if jid.Server == types.BotServer {
 		info.Topic = ptr.Ptr(BotChatTopic)
 	}
-	if jid == wa.JID.ToNonAD() {
+	if wa.IsOwnJID(jid) {
 		// For chats with self, force-split the members so the user's own ghost is always in the room.
 		info.Members.MemberMap = map[networkid.UserID]bridgev2.ChatMember{
 			waid.MakeUserID(jid): {EventSender: bridgev2.EventSender{Sender: waid.MakeUserID(jid)}},
@@ -189,7 +209,7 @@ func (wa *WhatsAppClient) wrapStatusBroadcastInfo(ctx context.Context) *bridgev2
 		Members: &bridgev2.ChatMemberList{
 			IsFull: false,
 			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
-				waid.MakeUserID(wa.JID): {EventSender: wa.makeEventSender(ctx, wa.JID)},
+				waid.MakeUserID(wa.GetLID()): {EventSender: wa.makeEventSender(ctx, wa.GetLID())},
 			},
 		},
 		Type:        ptr.Ptr(database.RoomTypeDefault),
@@ -253,11 +273,12 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		setAddressingMode(info.AddressingMode),
 		setTopicID(info.TopicID, info.Topic),
 	)
+	syncAllMembers := wa.Main.Config.MaxMemberSync < 0 || len(info.Participants) < wa.Main.Config.MaxMemberSync
 	wrapped := &bridgev2.ChatInfo{
 		Name:  ptr.Ptr(info.Name),
 		Topic: ptr.Ptr(info.Topic),
 		Members: &bridgev2.ChatMemberList{
-			IsFull:           !info.IsIncognito && !info.IsParent,
+			IsFull:           !info.IsIncognito && !info.IsParent && syncAllMembers,
 			TotalMemberCount: len(info.Participants),
 			MemberMap:        make(map[networkid.UserID]bridgev2.ChatMember, len(info.Participants)),
 			PowerLevels: &bridgev2.PowerLevelOverrides{
@@ -266,14 +287,13 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 				Ban:           ptr.Ptr(nobodyPL),
 				// TODO allow invites if bridge config says to allow them, or maybe if relay mode is enabled?
 				Events: map[event.Type]int{
-					event.StateRoomName:   metaChangePL,
-					event.StateRoomAvatar: metaChangePL,
-					event.StateTopic:      metaChangePL,
-					event.EventReaction:   defaultPL,
-					event.EventRedaction:  defaultPL,
-
+					event.StateRoomName:                metaChangePL,
+					event.StateRoomAvatar:              metaChangePL,
+					event.StateTopic:                   metaChangePL,
+					event.EventReaction:                defaultPL,
+					event.EventRedaction:               defaultPL,
+					event.EventUnstablePollResponse:    defaultPL,
 					event.StateBeeperDisappearingTimer: metaChangePL,
-					// TODO always allow poll responses
 				},
 			},
 		},
@@ -298,6 +318,9 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		} else if pcp.IsAdmin {
 			member.PowerLevel = ptr.Ptr(adminPL)
 		} else {
+			if !syncAllMembers && !member.EventSender.IsFromMe {
+				continue
+			}
 			member.PowerLevel = ptr.Ptr(defaultPL)
 		}
 		member.MemberEventExtra = map[string]any{
@@ -316,7 +339,7 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		}
 	}
 	if info.IsParent && !hasSelf && info.AddressingMode == types.AddressingModeLID {
-		wrapped.Members.MemberMap.Add(bridgev2.ChatMember{EventSender: wa.makeEventSender(ctx, wa.Device.LID)})
+		wrapped.Members.MemberMap.Add(bridgev2.ChatMember{EventSender: wa.makeEventSender(ctx, wa.GetLID())})
 	}
 
 	if !info.LinkedParentJID.IsEmpty() {
@@ -523,8 +546,8 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 		Members: &bridgev2.ChatMemberList{
 			TotalMemberCount: info.ThreadMeta.SubscriberCount,
 			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
-				waid.MakeUserID(wa.JID): {
-					EventSender: wa.makeEventSender(ctx, wa.JID),
+				waid.MakeUserID(wa.GetLID()): {
+					EventSender: wa.makeEventSender(ctx, wa.GetLID()),
 					PowerLevel:  &ownPowerLevel,
 				},
 			},
@@ -533,12 +556,12 @@ func (wa *WhatsAppClient) wrapNewsletterInfo(ctx context.Context, info *types.Ne
 				StateDefault:  ptr.Ptr(nobodyPL),
 				Ban:           ptr.Ptr(nobodyPL),
 				Events: map[event.Type]int{
-					event.StateRoomName:   adminPL,
-					event.StateRoomAvatar: adminPL,
-					event.StateTopic:      adminPL,
-					event.EventReaction:   defaultPL,
-					event.EventRedaction:  defaultPL,
-					// TODO always allow poll responses
+					event.StateRoomName:             adminPL,
+					event.StateRoomAvatar:           adminPL,
+					event.StateTopic:                adminPL,
+					event.EventReaction:             defaultPL,
+					event.EventRedaction:            defaultPL,
+					event.EventUnstablePollResponse: defaultPL,
 				},
 			},
 		},

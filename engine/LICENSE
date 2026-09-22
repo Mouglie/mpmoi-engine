@@ -1,18 +1,5 @@
 Copyright (C) 2026 mpmoi
 
-  The mpmoi engine (this repository: the Go engine under engine/ together with
-  the network bridges vendored under infra/matrix-native/src-{whatsapp,signal,
-  meta}) is free software: you can redistribute it and/or modify it under the
-  terms of the GNU Affero General Public License as published by the Free
-  Software Foundation, either version 3 of the License, or (at your option) any
-  later version.
-
-  The complete, verbatim text of the GNU Affero General Public License v3.0
-  follows. The vendored bridges additionally keep their own upstream LICENSE and
-  LICENSE.exceptions files unchanged.
-
-===============================================================================
-
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 

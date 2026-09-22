@@ -44,6 +44,16 @@ type Client struct {
 	cookies *cookies.Cookies
 	log     *zerolog.Logger
 
+	mobileLogin           *mobileLoginState
+	caaLogin              *instagramCAALoginState
+	webTwoFactor          *instagramWebTwoFactorState
+	webAuthPlatform       *instagramAuthPlatformState
+	webAccountManager     *instagramWebAccountManagerState
+	webCookieConsent      *instagramWebCookieConsentState
+	mobileLoginDevice     *types.InstagramLoginDevice
+	mobileSession         *instagramMobileSession
+	saveMobileLoginDevice func(context.Context, types.InstagramLoginDevice) error
+
 	socket        atomic.Pointer[dgw.Socket]
 	cancelSocket  atomic.Pointer[context.CancelFunc]
 	connectionCtx atomic.Pointer[context.Context]
@@ -65,6 +75,8 @@ type Client struct {
 
 	enableTyping bool
 
+	logRedactedBloksPayloads bool
+
 	eventHandler EventHandler
 
 	seqID   int64
@@ -83,6 +95,13 @@ type ClientParams struct {
 	SeqIDTS       time.Time
 	EventHandler  EventHandler
 	DisableTyping bool
+
+	LogRedactedBloksPayloads bool
+
+	// MobileLoginDevice and SaveMobileLoginDevice retain one Android installation
+	// identity across login processes for the same bridge user.
+	MobileLoginDevice     *types.InstagramLoginDevice
+	SaveMobileLoginDevice func(context.Context, types.InstagramLoginDevice) error
 }
 
 func NewClient(params ClientParams) *Client {
@@ -98,6 +117,14 @@ func NewClient(params ClientParams) *Client {
 		streamControllerStopped: exsync.NewEvent(),
 
 		enableTyping: !params.DisableTyping,
+
+		logRedactedBloksPayloads: params.LogRedactedBloksPayloads,
+
+		saveMobileLoginDevice: params.SaveMobileLoginDevice,
+	}
+	if params.MobileLoginDevice != nil {
+		device := *params.MobileLoginDevice
+		c.mobileLoginDevice = &device
 	}
 	c.SetEventHandler(params.EventHandler)
 	c.configs = httpclient.NewConfigs(c)
@@ -139,18 +166,21 @@ func (c *Client) loadIndex(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) ReloadIndex(ctx context.Context) error {
+func (c *Client) ReloadIndex(ctx context.Context) (bool, error) {
+	if c == nil {
+		return false, ErrClientIsNil
+	}
 	c.loadIndexLock.Lock()
 	defer c.loadIndexLock.Unlock()
 	if time.Since(c.lastReload) < 15*time.Minute {
 		zerolog.Ctx(ctx).Debug().
 			Time("last_reload", c.lastReload).
 			Msg("Not reloading again as last reload was recent")
-		return nil
+		return false, nil
 	}
 	err := c.loadIndex(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if s := c.socket.Load(); s != nil {
 		s.DeviceID = c.configs.BrowserConfigTable.IGDMqttWebDeviceID.ClientID
@@ -165,7 +195,7 @@ func (c *Client) ReloadIndex(ctx context.Context) error {
 	} else {
 		c.makeNewSocket()
 	}
-	return nil
+	return true, nil
 }
 
 func (c *Client) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetypes.Mailbox, error) {
@@ -198,7 +228,9 @@ func (c *Client) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetyp
 }
 
 func (c *Client) GetOwnFBID() int64 {
-	if c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU == "" || c.configs.BrowserConfigTable.PolarisViewer.Data.Fbid != c.configs.BrowserConfigTable.CurrentUserInitialData.NonFacebookUserID {
+	if c == nil || c.configs == nil ||
+		c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU == "" ||
+		c.configs.BrowserConfigTable.PolarisViewer.Data.Fbid != c.configs.BrowserConfigTable.CurrentUserInitialData.NonFacebookUserID {
 		return 0
 	}
 	fbid, _ := strconv.ParseInt(c.configs.BrowserConfigTable.CurrentUserInitialData.IGUserEIMU, 10, 64)
@@ -206,6 +238,9 @@ func (c *Client) GetOwnFBID() int64 {
 }
 
 func (c *Client) GetCookies() *cookies.Cookies {
+	if c == nil {
+		return nil
+	}
 	return c.cookies
 }
 
@@ -218,7 +253,7 @@ func (c *Client) GetPlatform() types.Platform {
 }
 
 func (c *Client) IsAuthenticated() bool {
-	return c.cookies.IsLoggedIn() && c.configs.BrowserConfigTable.PolarisViewer.ID != ""
+	return c != nil && c.cookies.IsLoggedIn() && c.configs.BrowserConfigTable.PolarisViewer.ID != ""
 }
 
 func (c *Client) GetLogger() *zerolog.Logger {
@@ -230,6 +265,9 @@ func (c *Client) SetLogger(logger zerolog.Logger) {
 }
 
 func (c *Client) GetHTTP() *httpclient.HTTPClient {
+	if c == nil {
+		return nil
+	}
 	return c.http
 }
 
@@ -263,12 +301,14 @@ func (c *Client) LoadState(state json.RawMessage) error {
 }
 
 func (c *Client) SetSeqID(seqID int64, ts time.Time) {
-	c.seqID = seqID
-	c.seqIDTS = ts
+	if c != nil {
+		c.seqID = seqID
+		c.seqIDTS = ts
+	}
 }
 
 func (c *Client) HasSeqID() bool {
-	return c.seqID != 0
+	return c != nil && c.seqID != 0
 }
 
 func (c *Client) DumpState() (json.RawMessage, error) {

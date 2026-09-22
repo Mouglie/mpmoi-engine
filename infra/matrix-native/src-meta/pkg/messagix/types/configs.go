@@ -65,6 +65,19 @@ type SprinkleConfig struct {
 	Version         int    `json:"version,omitempty"`
 }
 
+type InstagramWebPushInfo struct {
+	RolloutHash string `json:"rollout_hash,omitempty"`
+}
+
+type InstagramSecurityConfig struct {
+	CSRFToken string `json:"csrf_token,omitempty"`
+}
+
+type PolarisSiteData struct {
+	DeviceID           string `json:"device_id,omitempty"`
+	SendDeviceIDHeader bool   `json:"send_device_id_header,omitempty"`
+}
+
 type WebConnectionClassServerGuess struct {
 	ConnectionClass string `json:"connectionClass,omitempty"`
 }
@@ -103,6 +116,21 @@ type InstagramPasswordEncryption struct {
 	KeyID     string `json:"key_id,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
 	Version   string `json:"version,omitempty"`
+}
+
+// InstagramLoginDevice contains the installation-scoped identifiers used by the
+// native Android login flow. The official app persists these values across
+// account logins and app restarts.
+type InstagramLoginDevice struct {
+	PhoneID         string `json:"phone_id,omitempty"`
+	DeviceID        string `json:"device_id,omitempty"`
+	AdvertisingID   string `json:"advertising_id,omitempty"`
+	AndroidDeviceID string `json:"android_device_id,omitempty"`
+	MachineID       string `json:"machine_id,omitempty"`
+	USDID           string `json:"usdid,omitempty"`
+	USDIDKeyID      string `json:"usdid_key_id,omitempty"`
+	USDIDPrivateKey string `json:"usdid_private_key,omitempty"`
+	USDIDRegistered bool   `json:"usdid_registered,omitempty"`
 }
 
 type XIGSharedData struct {
@@ -229,6 +257,9 @@ type SchedulerJSDefineConfig struct {
 	BootloaderConfig              BootLoaderConfig
 	CurrentBusinessUser           CurrentBusinessAccount
 	SiteData                      SiteData
+	InstagramWebPushInfo          InstagramWebPushInfo
+	InstagramSecurityConfig       InstagramSecurityConfig
+	PolarisSiteData               PolarisSiteData
 	SprinkleConfig                SprinkleConfig
 	USIDMetadata                  USIDMetadata
 	WebConnectionClassServerGuess WebConnectionClassServerGuess
